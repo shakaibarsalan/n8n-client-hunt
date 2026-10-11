@@ -1,0 +1,123 @@
+# ===========================================================================
+#  Client Hunt — lead database
+#
+#  ISOLATION CONTRACT. Written to share a small host with other stacks
+#  (including the n8n that runs these workflows). Every line below that looks
+#  like boilerplate is here to keep this stack from touching any of them.
+#
+#    * Named project `n8n-client-hunt`, so `docker compose down` in this
+#      directory can only ever affect this stack.
+#    * Explicit subnet (172.23.0.0/16 by default). Letting Docker pick would
+#      eventually collide with the next project on the host. Check
+#      `docker network inspect` for what is already taken, and change it here
+#      if 172.23 is in use.
+#    * Port bound to 127.0.0.1 only. Docker's DNAT bypasses the host firewall
+#      INPUT chain, so a 0.0.0.0 binding here would be reachable from the
+#      internet.
+#    * mem_limit is not optional on a small host, especially one without
+#      swap: an unbounded container that leaks does not OOM itself, it gets
+#      something else killed - quite possibly the n8n that runs this
+#      project's own workflows.
+#    * Logging capped. An unbounded json-file log on a shared disk is a
+#      slow-motion outage for every other stack on the box.
+#
+#  Start:  docker compose up -d        (from the directory holding this file
+#                                       and its .env - see deploy/deploy.sh)
+#  Stop:   docker compose down          (volumes and the n8n network survive)
+# ===========================================================================
+
+name: n8n-client-hunt
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: clienthunt-postgres
+    restart: unless-stopped
+
+    # Loopback only; pick any free host port. n8n itself does not use this -
+    # it reaches the database container-to-container on 5432 (see below).
+    ports:
+      - "127.0.0.1:15434:5432"
+
+    environment:
+      POSTGRES_DB: clienthunt
+      POSTGRES_USER: clienthunt
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # Postgres defaults to the C locale in alpine; business names in this
+      # database are Norwegian, Spanish, Portuguese and Arabic-transliterated,
+      # and a C-collation index sorts them in an order no human recognises.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+      TZ: ${TZ:-UTC}
+
+    mem_limit: 512m
+    shm_size: 128m          # postgres uses shared memory for sorts and hashes
+
+    volumes:
+      - clienthunt_pgdata:/var/lib/postgresql/data
+      # Migrations are mounted read-only rather than copied in, so that
+      # redeploying does not mean rebuilding an image.
+      - ./db:/migrations:ro
+
+    healthcheck:
+      # `pg_isready` alone returns success while the server is still replaying
+      # WAL and refusing connections, so this does a real query.
+      test: ["CMD-SHELL", "psql -U clienthunt -d clienthunt -c 'SELECT 1' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+    networks:
+      - default        # this stack's own subnet
+      - n8n            # so the n8n container can reach us by hostname
+
+  # Files CH-05's BCC copies of sent outreach under Sent, out of the Inbox
+  # where the replies arrive (tools/file_sent_copies.py has the why). Stock
+  # image; given the four mailbox settings it needs and none of the other
+  # secrets in .env.
+  mail-filer:
+    image: python:3.12-slim
+    container_name: clienthunt-mail-filer
+    restart: unless-stopped
+    command: ["python", "-u", "/app/file_sent_copies.py", "--every", "300"]
+    environment:
+      IMAP_HOST: ${IMAP_HOST:?set IMAP_HOST in .env}
+      IMAP_PORT: ${IMAP_PORT:-993}
+      OUTREACH_USER: ${OUTREACH_USER:?set OUTREACH_USER in .env}
+      OUTREACH_PASSWORD: ${OUTREACH_PASSWORD:?set OUTREACH_PASSWORD in .env}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./tools/file_sent_copies.py:/app/file_sent_copies.py:ro
+    mem_limit: 64m
+    logging:
+      driver: json-file
+      options: { max-size: "1m", max-file: "2" }
+    networks:
+      - default
+
+networks:
+  default:
+    name: clienthunt_default
+    ipam:
+      config:
+        - subnet: 172.23.0.0/16
+
+  # The network your n8n container is on, created by n8n's own compose
+  # project (`n8n_default` when that project is named `n8n`; set N8N_NETWORK
+  # in .env otherwise). Declared external so that `docker compose down` in
+  # this directory can NEVER delete the network n8n is running on - removing
+  # it would take n8n down with it.
+  #
+  # This is what lets a Postgres node inside n8n use host `clienthunt-postgres`
+  # port 5432 - container-to-container, never over the host's loopback.
+  n8n:
+    name: ${N8N_NETWORK:-n8n_default}
+    external: true
+
+volumes:
+  clienthunt_pgdata:
+    name: clienthunt_pgdata

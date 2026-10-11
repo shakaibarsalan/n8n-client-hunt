@@ -1,0 +1,230 @@
+[
+  {
+    "placeId": "sample-place-01",
+    "title": "Eksempel Test Listing",
+    "phone": "+47 400 00 101",
+    "phoneUnformatted": "+4740000101",
+    "categoryName": "Beauty salon",
+    "categories": [
+      "Beauty salon",
+      "Service establishment"
+    ],
+    "address": "Eksempelgata 1, 0150 Oslo, Norge",
+    "street": "Eksempelgata 1",
+    "city": "Oslo",
+    "postalCode": "0150",
+    "countryCode": "NO",
+    "location": {
+      "lat": 59.9031,
+      "lng": 10.7047
+    },
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=Eksempel%20Test%20Listing&query_place_id=sample-place-01",
+    "neighborhood": "Sentrum"
+  },
+  {
+    "placeId": "sample-place-02",
+    "title": "Salong Eksempel",
+    "phone": "+47 400 00 102",
+    "phoneUnformatted": "+4740000102",
+    "categoryName": "Hair salon",
+    "categories": [
+      "Hair salon"
+    ],
+    "address": "Eksempelgata 2, 0151 Oslo, Norge",
+    "street": "Eksempelgata 2",
+    "city": "Oslo",
+    "postalCode": "0151",
+    "countryCode": "NO",
+    "location": {
+      "lat": 59.9062,
+      "lng": 10.7094
+    },
+    "totalScore": 4.7,
+    "reviewsCount": 23,
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=Salong%20Eksempel&query_place_id=sample-place-02",
+    "neighborhood": "Sentrum"
+  },
+  {
+    "placeId": "sample-place-03",
+    "title": "Nordlys Hair Studio (sample)",
+    "phone": "+47 400 00 103",
+    "phoneUnformatted": "+4740000103",
+    "categoryName": "Hair salon",
+    "categories": [
+      "Hair salon",
+      "Beauty salon"
+    ],
+    "address": "Testveien 3, 0152 Oslo, Norge",
+    "street": "Testveien 3",
+    "city": "Oslo",
+    "postalCode": "0152",
+    "countryCode": "NO",
+    "location": {
+      "lat": 59.9093,
+      "lng": 10.7141
+    },
+    "totalScore": 4.2,
+    "reviewsCount": 5,
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=Nordlys%20Hair%20Studio%20%28sample%29&query_place_id=sample-place-03",
+    "neighborhood": "Eksempelby"
+  },
+  {
+    "placeId": "sample-place-04",
+    "title": "@lashlift.sample",
+    "phone": "+47 400 00 104",
+    "phoneUnformatted": "+4740000104",
+    "categoryName": "Eyelash salon",
+    "categories": [
+      "Eyelash salon"
+    ],
+    "address": "Testveien 4, 0153 Oslo, Norge",
+    "street": "Testveien 4",
+    "city": "Oslo",
+    "postalCode": "0153",
+    "countryCode": "NO",
+    "location": {
+      "lat": 59.9124,
+      "lng": 10.7188
+    },
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=%40lashlift.sample&query_place_id=sample-place-04",
+    "neighborhood": "Eksempelby"
+  },
+  {
+    "placeId": "sample-place-05",
+    "title": "Fjordlys Frisør",
+    "phone": "+47 400 00 105",
+    "phoneUnformatted": "+4740000105",
+    "categoryName": "Hairdresser",
+    "categories": [
+      "Hairdresser",
+      "Hair salon"
+    ],
+    "address": "Prøvegata 5, 0154 Oslo, Norge",
+    "street": "Prøvegata 5",
+    "city": "Oslo",
+    "postalCode": "0154",
+    "countryCode": "NO",
+    "location": {
+      "lat": 59.9155,
+      "lng": 10.7235
+    },
+    "totalScore": 4.9,
+    "reviewsCount": 41,
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=Fjordlys%20Fris%C3%B8r&query_place_id=sample-place-05",
+    "neighborhood": "Testvik"
+  },
+  {
+    "placeId": "sample-place-06",
+    "title": "Kari Nordmann Hudpleie",
+    "phone": "+47 400 00 106",
+    "phoneUnformatted": "+4740000106",
+    "categoryName": "Beauty salon",
+    "categories": [
+      "Beauty salon",
+      "Hair removal service"
+    ],
+    "address": "Prøvegata 6, 0155 Oslo, Norge",
+    "street": "Prøvegata 6",
+    "city": "Oslo",
+    "postalCode": "0155",
+    "countryCode": "NO",
+    "location": {
+      "lat": 59.9186,
+      "lng": 10.7282
+    },
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=Kari%20Nordmann%20Hudpleie&query_place_id=sample-place-06",
+    "neighborhood": "Testvik"
+  },
+  {
+    "placeId": "sample-place-07",
+    "title": "Glimt Negler",
+    "phone": "+34 600 00 00 01",
+    "phoneUnformatted": "+34600000001",
+    "categoryName": "Nail salon",
+    "categories": [
+      "Nail salon"
+    ],
+    "address": "Eksempelveien 7, 0156 Oslo, Norge",
+    "street": "Eksempelveien 7",
+    "city": "Oslo",
+    "postalCode": "0156",
+    "countryCode": "NO",
+    "location": {
+      "lat": 59.9217,
+      "lng": 10.7329
+    },
+    "totalScore": 5.0,
+    "reviewsCount": 2,
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=Glimt%20Negler&query_place_id=sample-place-07"
+  },
+  {
+    "placeId": "sample-place-08",
+    "title": "Testvik Skjønnhetssalong",
+    "phone": "+47 400 00 108",
+    "phoneUnformatted": "+4740000108",
+    "categoryName": "Beauty salon",
+    "categories": [
+      "Beauty salon"
+    ],
+    "address": "Eksempelveien 8, 0157 Oslo, Norge",
+    "street": "Eksempelveien 8",
+    "city": "Oslo",
+    "postalCode": "0157",
+    "countryCode": "NO",
+    "location": {
+      "lat": 59.9248,
+      "lng": 10.7376
+    },
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=Testvik%20Skj%C3%B8nnhetssalong&query_place_id=sample-place-08",
+    "neighborhood": "Testvik"
+  },
+  {
+    "placeId": "sample-place-09",
+    "title": "Lumi Beauty Studio",
+    "categoryName": "Beauty salon",
+    "categories": [
+      "Beauty salon"
+    ],
+    "location": {
+      "lat": 59.9279,
+      "lng": 10.7423
+    },
+    "totalScore": 4.5,
+    "reviewsCount": 11,
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=Lumi%20Beauty%20Studio&query_place_id=sample-place-09"
+  },
+  {
+    "placeId": "sample-place-10",
+    "title": "Eksempelvik Fotterapi",
+    "categoryName": "Beauty product supplier",
+    "categories": [
+      "Beauty product supplier",
+      "Beauty salon"
+    ],
+    "location": {
+      "lat": 59.931,
+      "lng": 10.747
+    },
+    "permanentlyClosed": false,
+    "temporarilyClosed": false,
+    "url": "https://www.google.com/maps/search/?api=1&query=Eksempelvik%20Fotterapi&query_place_id=sample-place-10"
+  }
+]

@@ -1,0 +1,41 @@
+# Written before the first commit, deliberately.
+#
+# The job-hunt repo's .gitignore opens by saying that the session file and
+# every key stayed out of git only because this file existed first. The same
+# reasoning applies harder here: this project will hold an Apify token, a
+# Serper key, a Supabase connection string and an n8n API key, and any one of
+# them in a public commit is a rotation emergency.
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+credentials*.json
+service-account*.json
+*.pem
+*.key
+
+# --- Data. Nothing scraped or downloaded belongs in git. ---
+# Overture / Foursquare parquet is hundreds of MB and is re-downloadable.
+# Lead data is personal data about real businesses; it stays in Postgres.
+data/
+*.parquet
+*.csv
+*.tsv
+*.xlsx
+*.db
+*.sqlite
+
+# --- Fixtures are the exception: saved HTML is the whole point of the
+#     offline test loop, so tests/fixtures/ is tracked on purpose. ---
+
+# --- Tooling noise ---
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+Thumbs.db
+*.log

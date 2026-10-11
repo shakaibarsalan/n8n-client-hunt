@@ -1,0 +1,29 @@
+# Everything is LF in the repository, whatever the checkout looks like.
+#
+# This is not tidiness. Three things here break outright on CRLF:
+#
+#   * deploy/deploy.sh runs on the Linux server. A CRLF shebang fails with
+#     "bad interpreter: /usr/bin/env bash^M", which names the interpreter and
+#     so reads as a missing bash rather than a line-ending problem.
+#   * The SQL files are piped into psql inside a container.
+#   * n8n Code node bodies are built from the snippets. A stray \r at the end
+#     of every line shows up in the n8n editor and travels into the stored
+#     workflow.
+#
+# Authoring happens on Windows, deployment on Linux, so without this the
+# breakage depends on whose machine last touched the file.
+
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.js   text eol=lf
+*.sql  text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+
+*.png    binary
+*.jpg    binary
+*.parquet binary
+*.gz     binary

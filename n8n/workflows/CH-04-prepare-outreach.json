@@ -1,0 +1,398 @@
+{
+  "name": "CH-04 Client Hunt - Prepare outreach",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/10 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "ch04-trigger-cron",
+      "name": "Every 10 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ch04-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c1",
+              "name": "batch_size",
+              "value": 40,
+              "type": "number"
+            },
+            {
+              "id": "c2",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "c3",
+              "name": "auto_approve",
+              "value": true,
+              "type": "boolean"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch04-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "This workflow only ever WRITES DRAFTS. Nothing it does sends an email - that is CH-04's job, and CH-04 only sends a row a human has already set to 'approved'."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT country_code, law, note, rule FROM consent_required_countries;",
+        "options": {}
+      },
+      "id": "ch04-consent",
+      "name": "Load consent-required countries",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-04: who is due a drafted message?\n--\n-- Two halves, unioned:\n--\n--   Step 1 (opener)   qualified leads with an email on file that have never\n--                      had a step-1 draft written.\n--\n--   Follow-ups       the next step after the latest SENT message (2, then 3), whose\n--                      wait_days have passed, which have not replied or\n--                      bounced, and which have no step-2 draft yet.\n--\n-- A business with no email is not selected at all - there is nothing to\n-- draft, and creating a permanent \"needs_review: no email\" row for every\n-- no-website lead (which is most of them, by design) would drown the queue in\n-- noise. When Stage F later finds an email, the next CH-04 run picks it up\n-- naturally, because absence here is not a decision, just nothing to do yet.\n--\n-- Already-suppressed addresses are excluded outright, not flagged for review.\n-- A suppression entry means \"do not contact\" with no human override implied -\n-- reversing it is a data change (delete the suppression row), not a draft\n-- decision.\n--\n-- website_url, name_norm and city are selected for the address check in\n-- render-outreach-draft.js: an email must carry the business's name, or sit on\n-- its own named site, before a draft is left un-held.\n--\n-- site_corroborated: how we know the business's site is THEIRS - its phone\n-- or street address on the page ('phone' / 'address'), or the Maps listing\n-- itself linking it ('listing'). A name match alone is 'none', and\n-- render-outreach-draft.js holds those for a human: same-named companies in\n-- other countries were being drafted (a same-named company in Slovakia).\n--\n-- Template choice: WEAK_WEBSITE leads get the 'weak_website' slug, not\n-- 'default'. The default opener says \"you don't seem to have your own\n-- website yet\" - true for a NO_WEBSITE lead, false for one that has a site\n-- and just needs a better one. See db/010_weak_website_template.sql. A\n-- follow-up reuses whichever slug its own step-1 message used, so a\n-- sequence never switches pitch mid-conversation.\n\nWITH latest_score AS (\n  SELECT DISTINCT ON (business_id) business_id, qualified, needs_review\n  FROM lead_scores\n  ORDER BY business_id, scored_at DESC\n),\n\nopener AS (\n  SELECT\n    b.id, b.name, b.email, b.country, b.country_code, b.social_profiles,\n    b.permanently_closed, b.website_status, b.website_url, b.name_norm, b.city,\n    COALESCE(\n      (SELECT wc.evidence ->> 'corroborated' FROM website_checks wc\n        WHERE wc.business_id = b.id AND wc.stage = 'probe' AND wc.outcome = 'found'\n          AND wc.evidence ? 'corroborated'\n        ORDER BY wc.checked_at DESC LIMIT 1),\n      (SELECT 'listing' FROM website_checks wc\n        WHERE wc.business_id = b.id AND wc.stage = 'source'\n          AND wc.evidence ->> 'claim' = 'real' LIMIT 1),\n      'none') AS site_corroborated,\n    b.raw ->> 'email_source' AS email_source,\n    (SELECT c.rule FROM consent_required_countries c WHERE c.country_code = lower(b.country_code)) AS consent_rule,\n    b.niche, b.category_primary,\n    (SELECT (wc.evidence ->> 'performance')::numeric FROM website_checks wc\n      WHERE wc.business_id = b.id AND wc.method = 'pagespeed.mobile' AND wc.outcome = 'found'\n        AND wc.evidence ? 'performance'\n      ORDER BY wc.checked_at DESC LIMIT 1) AS psi_performance,\n    t.id AS template_id, t.sequence_step, t.subject AS template_subject, t.body AS template_body,\n    NULL::text AS first_subject\n  FROM businesses b\n  JOIN latest_score s ON s.business_id = b.id AND s.qualified AND NOT s.needs_review\n  JOIN outreach_templates t\n    ON t.slug = (CASE WHEN b.website_status = 'WEAK_WEBSITE' THEN 'weak_website'\n                      -- The listing's \"website\" is a Google business.site page, all of\n                      -- which Google shut down in 2024: the one true, specific thing\n                      -- we can tell them, so it gets its own pitch.\n                      WHEN b.raw ->> 'website' ~* '(^|[/.])business[.]site' THEN 'dead_google_site'\n                      ELSE 'default' END)\n   AND t.sequence_step = 1 AND t.active\n  WHERE b.email IS NOT NULL AND b.email <> ''\n    AND b.name !~* '(sameie|borettslag|parkering|parking|mosque|masjid|embassy|consulate|ministry|government|municipality|kommune|forening|association|residence|townhouse|bed ?space|partition|hostel|accommodation|labou?r camp)'   -- not small-business prospects; see insert-open-data-leads.sql\n    AND b.permanently_closed = false\n    AND NOT EXISTS (\n      SELECT 1 FROM outreach o WHERE o.business_id = b.id AND o.sequence_step = 1)\n    -- Several listings can carry one shared gmail; one opener per address.\n    AND NOT EXISTS (\n      SELECT 1 FROM outreach o WHERE lower(o.to_email) = lower(b.email))\n    AND NOT EXISTS (\n      SELECT 1 FROM suppression sup\n      WHERE (sup.kind = 'email' AND lower(sup.value) = lower(b.email))\n         OR (sup.kind = 'place_id' AND sup.value = b.google_place_id))\n),\n\nfollowup AS (\n  SELECT\n    b.id, b.name, b.email, b.country, b.country_code, b.social_profiles,\n    b.permanently_closed, b.website_status, b.website_url, b.name_norm, b.city,\n    COALESCE(\n      (SELECT wc.evidence ->> 'corroborated' FROM website_checks wc\n        WHERE wc.business_id = b.id AND wc.stage = 'probe' AND wc.outcome = 'found'\n          AND wc.evidence ? 'corroborated'\n        ORDER BY wc.checked_at DESC LIMIT 1),\n      (SELECT 'listing' FROM website_checks wc\n        WHERE wc.business_id = b.id AND wc.stage = 'source'\n          AND wc.evidence ->> 'claim' = 'real' LIMIT 1),\n      'none') AS site_corroborated,\n    b.raw ->> 'email_source' AS email_source,\n    (SELECT c.rule FROM consent_required_countries c WHERE c.country_code = lower(b.country_code)) AS consent_rule,\n    b.niche, b.category_primary,\n    (SELECT (wc.evidence ->> 'performance')::numeric FROM website_checks wc\n      WHERE wc.business_id = b.id AND wc.method = 'pagespeed.mobile' AND wc.outcome = 'found'\n        AND wc.evidence ? 'performance'\n      ORDER BY wc.checked_at DESC LIMIT 1) AS psi_performance,\n    t.id AS template_id, t.sequence_step, t.subject AS template_subject, t.body AS template_body,\n    -- The subject step 1 actually went out with (after rendering), so a\n    -- follow-up can be 'Re: <that>' and land in the same conversation.\n    (SELECT o1.subject FROM outreach o1\n      WHERE o1.business_id = b.id AND o1.sequence_step = 1 AND o1.sent_at IS NOT NULL\n      ORDER BY o1.sent_at LIMIT 1) AS first_subject\n  FROM businesses b\n  -- The NEXT step after the latest one sent, whichever it is: step 2 after a\n  -- sent step 1, step 3 after a sent step 2. wait_days counts from the\n  -- previous message. Same slug throughout, so a sequence never switches\n  -- pitch mid-conversation.\n  JOIN outreach prev ON prev.business_id = b.id AND prev.status = 'sent'\n  JOIN outreach_templates prev_t ON prev_t.id = prev.template_id\n  JOIN outreach_templates t ON t.slug = prev_t.slug\n                          AND t.sequence_step = prev.sequence_step + 1 AND t.active\n  WHERE prev.sent_at <= now() - make_interval(days => t.wait_days)\n    AND b.permanently_closed = false\n    AND NOT EXISTS (\n      SELECT 1 FROM outreach o WHERE o.business_id = b.id AND o.sequence_step = t.sequence_step)\n    -- Anyone who replied to or bounced ANY message in the sequence is done.\n    AND NOT EXISTS (\n      SELECT 1 FROM outreach o WHERE o.business_id = b.id AND o.status IN ('replied', 'bounced'))\n    AND NOT EXISTS (\n      SELECT 1 FROM suppression sup\n      WHERE (sup.kind = 'email' AND lower(sup.value) = lower(b.email))\n         OR (sup.kind = 'place_id' AND sup.value = b.google_place_id))\n)\n\nSELECT * FROM opener\nUNION ALL\nSELECT * FROM followup\nLIMIT $1;\n",
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.batch_size] }}"
+        }
+      },
+      "id": "ch04-candidates",
+      "name": "Who is due a message?",
+      "type": "n8n-nodes-base.postgres",
+      "executeOnce": true,
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        290
+      ],
+      "alwaysOutputData": true,
+      "notes": "A business with no email is not selected at all - nothing to draft yet. When Stage F later finds one, the next run picks it up on its own. Already-suppressed addresses are excluded outright here, not flagged for review.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// CH-04, node: \"Is this a natural person or a trading name?\"\n// Mode: Run Once for All Items\n//\n// Norway's Marketing Control Act section 15 requires PRIOR CONSENT before\n// electronic marketing to a natural person - a different rule than reaching a\n// company mailbox. A large share of one-person salons trade under their own\n// name rather than a business name: \"Nail IT! <first> <middle> <surname>\" and\n// \"<word> beauty Advisor <full name>\" are the shapes of two real businesses in\n// the first 30 leads this project found, and both are, legally, a person.\n// (Names in this file are fictional stand-ins - Kari/Ola Nordmann and the\n// like - never the real traders'.)\n//\n// This is a HEURISTIC, not a legal determination. It exists to make the safe\n// default automatic - hold and ask a human - rather than to make the final\n// call. Getting this wrong in the cautious direction costs a manual review\n// click. Getting it wrong in the other direction is a compliance breach in\n// somebody's name, not just a bad email.\n//\n// Run Once for ALL Items, not each - deliberately, and not how this was\n// first written. \"Who is due a message?\" has alwaysOutputData set, so this\n// node still runs (and CH-04 does not silently do nothing with no trace)\n// even when nothing is due, and a zero-row query arrives as ONE blank item\n// ({}), not zero items. The first fix for that tried to filter it out by\n// returning [] for that one item - which is not valid in \"Run Once for Each\n// Item\" mode. n8n does not treat an empty array there as \"no output for this\n// item\": either it errors (\"Code doesn't return a single object... An array\n// of objects was returned\"), or - what actually happened running this for\n// real - it is coerced into another blank placeholder one step further down\n// the chain, and \"Insert the draft\" crashed on the exact same NOT NULL\n// violation as before, just moved. \"Run Once for All Items\" mode has no such\n// restriction: an empty array is simply zero items, which is what Stage A in\n// CH-02 already relies on for the identical shape of bug, verified working\n// live in production.\n\nconst consentCountries = $('Load consent-required countries').all().map((i) => i.json);\n\n// Titles, role words and niche vocabulary that precede or follow a name\n// without themselves being part of it. Stripped before judging whether what\n// is left looks like a person.\n//\n// This is a heuristic over a small vocabulary, not general-purpose name\n// detection, and it says so honestly rather than pretending otherwise. Two\n// classes of false positive it does NOT catch, found on the first 30 real\n// leads and left as a documented limitation rather than chased further,\n// because the cost of a false positive here is one manual review click,\n// which is the safe direction:\n//\n//   * a coined/compound trading name sharing a root with a role word -\n//     \"LumiBee Frisor-Health\" is not \"Frisor\" once hyphenated and cased\n//     differently, so it is not caught by an exact-match list.\n//   * a descriptor ahead of a real name - \"Nail & Spa GARDEN Kari Nordmann\"\n//     pulls in \"Garden\" as part of the matched run. The HOLD this produces\n//     is still correct (the trader is a real person); only the\n//     extracted first name for the greeting is imprecise, and a human\n//     reviews every held draft before it can be approved regardless.\nconst ROLE_WORDS = new Set([\n  'salon', 'salong', 'salonger', 'studio', 'beauty', 'hair', 'nails', 'nail',\n  'spa', 'clinic', 'klinikk', 'advisor', 'consulting', 'by', 'frisor', 'fris\u00f8r',\n  // Norwegian service vocabulary for this niche - added after \"<Placename>\n  // Fotterapi\" (a care-facility's foot-therapy service, not a person) was\n  // flagged as a two-word name because \"Fotterapi\" matched nothing.\n  'fotterapi', 'hudpleie', 'massasje', 'negler', 'skjonnhetssalong',\n  'skj\u00f8nnhetssalong', 'kapper', 'parrucchiere', 'peluqueria', 'estetica',\n  // Geography. A city or country name run alongside another capitalised word\n  // reads exactly like a two-word name to a check this simple - confirmed on\n  // \"<Word> Nail Supply in Oslo Norway\", which matched \"Oslo Norway\".\n  // Kept to the countries and cities this project's own search_targets\n  // actually covers; extend it there if the geographic scope grows.\n  'oslo', 'norway', 'norge', 'dubai', 'uae', 'emirates', 'abu', 'dhabi',\n  'stockholm', 'sweden', 'copenhagen', 'denmark', 'barcelona', 'madrid',\n  'spain', 'lisbon', 'portugal', 'milan', 'italy', 'toronto', 'vancouver',\n  'canada', 'doha', 'qatar',\n  // Business and real-estate vocabulary - added after \"<District> House\n  // Apartments\" and \"The APARTMENTS company\" were both held as people's names,\n  // and \"Hi <District>,\" / \"Hi The,\" reached a drafted greeting.\n  'the', 'and', 'house', 'apartments', 'apartment', 'company', 'group', 'hotel',\n  'hotell', 'eiendom', 'eiendomsmegling', 'megler', 'meglerhuset', 'properties',\n  'property', 'real', 'estate', 'realty', 'homes', 'bolig', 'utleie', 'invest',\n  'holding', 'partners', 'services', 'senter', 'center', 'centre',\n  'international', 'ladies', 'gents', 'barber', 'barbershop',\n]);\n\n// Street names end in a handful of suffixes, and Google Maps often appends the\n// street to a listing's name (\"... - Eksempelgata 2\").\nconst STREET = /(gata|gate|gaten|veien|vei|vegen|plass|plassen|torg|torget|street|road|avenue)$/i;\n\n// A capitalised run of 2-3 words, none of them a role word, none of them\n// shorter than 3 letters (an initial or a short acronym like \"IT\" - from\n// \"Nail IT! <name>...\" - reads as noise, not as a name on its own), is\n// treated as a person's name embedded in the business name.\nconst looksLikeAName = (run) => {\n  if (run.length < 2 || run.length > 3) return false;\n  return run.every((w) => {\n    const bare = w.replace(/[^\\p{L}]/gu, '');\n    return bare.length >= 3 &&\n           bare[0] === bare[0].toUpperCase() &&\n           !ROLE_WORDS.has(bare.toLowerCase()) &&\n           !STREET.test(bare);\n  });\n};\n\nconst out = [];\n\nfor (const item of $input.all().filter((i) => i.json && i.json.id != null)) {\n  const b = item.json;\n\n  const requiresConsent = consentCountries.find(\n    (c) => String(c.country_code).toLowerCase() === String(b.country_code || '').toLowerCase());\n\n  const words = String(b.name || '').split(/\\s+/).filter(Boolean);\n\n  let personName = '';\n  for (let i = 0; i < words.length; i++) {\n    for (const len of [3, 2]) {\n      const run = words.slice(i, i + len);\n      if (run.length === len && looksLikeAName(run)) {\n        // Prefer the longest run found; keep scanning in case a longer one\n        // exists later in the string, but do not overwrite a 3-word match\n        // with a 2-word one.\n        if (run.length > personName.split(/\\s+/).filter(Boolean).length) {\n          personName = run.join(' ');\n        }\n      }\n    }\n  }\n\n  // Fail closed: a detected name holds the lead whether or not the country\n  // is in consent_required_countries. Absence from that table means \"nobody\n  // has checked this country's law yet,\" not \"this country has no such\n  // law\" - the migration that creates the table says so explicitly, and the\n  // hold here is what makes that promise true rather than aspirational.\n  //\n  // Except where the country's recorded rule is 'opt_out': there a named\n  // trader may be emailed, because every message carries an opt-out, so the\n  // name is noted but nothing is held. (The UAE, on the owner's instruction -\n  // most of what this flagged there was \"<Word> Dental\", \"<Word> Times\n  // Restaurant\": trading names, not people.)\n  const optOutCountry = requiresConsent && requiresConsent.rule === 'opt_out';\n  const isNaturalPerson = Boolean(personName) && !optOutCountry;\n\n  let reason = null;\n  if (personName && optOutCountry) {\n    reason = `\"${personName}\" may be a person's name; ${b.country} is recorded as opt-out ` +\n      `(${requiresConsent.law}), so it is not held - the message carries an opt-out.`;\n  } else if (isNaturalPerson) {\n    reason = requiresConsent\n      ? `\"${personName}\" reads as a person's name, and ${b.country} requires prior consent ` +\n        `for electronic marketing to a natural person (${requiresConsent.law}).`\n      : `\"${personName}\" reads as a person's name. ${b.country || 'This country'} is not yet in ` +\n        `consent_required_countries, so its rule is unverified rather than confirmed safe - ` +\n        `held as a precaution. Check the law and add the country if cold email to a named ` +\n        `individual is actually permitted there.`;\n  }\n\n  out.push({\n    json: {\n      ...b,\n      is_natural_person: isNaturalPerson,\n      detected_person_name: personName || null,\n      natural_person_reason: reason,\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "ch04-natural-person",
+      "name": "Is this a natural person or a trading name?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        290
+      ],
+      "notes": "A heuristic, not a legal determination. It exists to make the safe default automatic: hold and ask a human, never guess and send."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-04: persist the natural-person detection onto the business row.\n--\n-- Computed fresh every time by detect-natural-person.js (it is cheap and\n-- deterministic), but written back here so the reasoning is visible on the\n-- business itself without re-running the detector, and so a person looking at\n-- the businesses table directly can see why a lead is held.\n\nUPDATE businesses SET\n  is_natural_person     = $2::boolean,\n  natural_person_reason = NULLIF($3, '')\nWHERE id = $1::bigint;\n",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.is_natural_person, $json.natural_person_reason || ''] }}"
+        }
+      },
+      "id": "ch04-cache-flag",
+      "name": "Cache the natural-person flag",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        320,
+        180
+      ],
+      "notes": "A dead-end branch on purpose - this just records the flag on the business row for visibility. The main chain below does not wait on it.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// CH-04, node: \"Render the draft and guard it\"\n// Mode: Run Once for Each Item\n//\n// Turns one (business, template) pair into a subject/body, and decides\n// whether it is safe to leave in 'draft' or must be held as 'needs_review'.\n//\n// The guard is deliberately generous about what it flags and strict about\n// what it lets straight through. The failure mode this project cares most\n// about is not \"a good lead sat in review for an extra day\" - it is \"a\n// message went out that should not have.\"\n//\n// Ported pattern from the job-hunt project's letter guard: a check that flags\n// too eagerly gets waved away out of habit, including the one time it is\n// right. Every flag below is something that was actually found in these 30\n// leads, not a hypothetical.\n\nconst b = $json;                                   // business, with template fields merged in\n\nconst problems = [];\n\n// --- 1. Is there anywhere to send this? -------------------------------------\nconst email = String(b.email || '').trim();\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nif (!email || !EMAIL_RE.test(email)) {\n  problems.push('no usable email address on file');\n}\n\n// --- 2. Is this actually the kind of lead this project targets? ------------\nconst OPPORTUNITY = new Set(['NO_WEBSITE_CONFIRMED', 'NO_WEBSITE_LIKELY', 'WEAK_WEBSITE']);\nif (!OPPORTUNITY.has(b.website_status)) {\n  problems.push(`website_status is ${b.website_status}, not an opportunity this pitch fits`);\n}\nif (b.permanently_closed) {\n  problems.push('business is permanently closed');\n}\n\n// --- 3. The consent hold ----------------------------------------------------\nif (b.is_natural_person) {\n  problems.push(b.natural_person_reason || 'flagged as a natural person - consent required');\n}\n\n// --- 3b. In a consent country, only a legal entity is emailed ---------------\n//\n// Norway's Marketing Control Act s.15 protects natural persons, and a sole\n// proprietorship (enkeltpersonforetak) IS its owner - whatever the trading\n// name says. The name check above only catches names that look like a\n// person's; a sole trader's \"<first name>s frisor\" with a personal hotmail\n// address, and a one-word trading name, went through it. So in a country whose rule is\n// 'consent', the name must carry a company form (AS, ASA, AB, ApS, Ltd...)\n// before anything goes out on its own. The rest belong on the call list.\nconst COMPANY_FORM = /(^|\\s)(AS|ASA|A\\/S|ApS|AB|DA|SA|BV|GmbH|Ltd\\.?|Limited|Inc\\.?|LLC|Oy)(\\s|$|,)/;\nif (b.consent_rule === 'consent' && !COMPANY_FORM.test(String(b.name || ''))) {\n  problems.push(`no company form (AS, ASA...) in \"${b.name}\" - likely a sole proprietorship, which ` +\n    `${b.country || 'this country'} treats as a natural person needing prior consent; call instead`);\n}\n\n// --- 4. Suppressed already? -------------------------------------------------\nif (b.is_suppressed) {\n  problems.push(`suppressed: ${b.suppression_reason || 'no reason recorded'}`);\n}\n\n// --- 5. Does this address actually belong to THIS business? ----------------\n//\n// An email is only as good as the page it was found on. Stage F reads it off\n// whatever site CH-02 settled on, and for months that site could be a\n// neighbour's: a phone number shared with the clinic a stylist rents a chair\n// in, a directory, an estate agent's parent company. The queue that existed\n// when this check was written held 9 drafts, and 7 were addressed to a\n// different business than the one named in the message:\n//\n//   Beauty Care by KN           -> post@klinikk-a.test         (the clinic she works in)\n//   Fjordlys Frisor og ...      -> post@nabo-klinikk.test      (a neighbour)\n//   Sample Ladies ... Dubai     -> info@salons-directory.test  (a directory)\n//\n// (Names and domains here are fictional stand-ins for the real rows.)\n//\n// So the address has to carry the business's name: in its domain, or - for a\n// free mailbox like gmail - in the part before the @, or it has to sit on the\n// business's own website whose domain carries the name. Anything else is\n// held for a human, who can still approve it knowingly. A held draft costs a\n// day; an email to the wrong business costs the first impression.\nconst fold = (s) => String(s || '').toLowerCase()\n  .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n  .replace(/\\u00f8/g, 'o').replace(/\\u00e6/g, 'ae').replace(/\\u00e5/g, 'a')\n  .replace(/\\u0153/g, 'oe').replace(/\\u00df/g, 'ss')\n  .replace(/[^a-z0-9]+/g, ' ').trim();\n\n// Words that prove nothing: the niche itself, legal forms, and places. A\n// Dubai directory's domain says \"dubai\"; a Dubai salon's name says it too.\nconst NOT_DISTINCTIVE = new Set([\n  'salon', 'salong', 'beauty', 'hair', 'spa', 'nails', 'barber', 'studio',\n  'frisor', 'kapper', 'peluqueria', 'estetica', 'parrucchiere', 'ladies', 'gents',\n  'real', 'estate', 'realty', 'properties', 'property', 'homes', 'eiendom', 'megler',\n  'centre', 'center', 'senter', 'clinic', 'klinikk', 'shop', 'store', 'house', 'home',\n  'international', 'group', 'company', 'services', 'service',\n  'oslo', 'norge', 'norway', 'dubai', 'emirates', 'sharjah', 'ajman',\n  'and', 'the', 'for', 'your', 'best', 'new', 'city', 'llc', 'gmbh',\n]);\nfor (const w of fold(b.city).split(' ')) NOT_DISTINCTIVE.add(w);\n\nconst nameTokens = fold(b.name_norm || b.name).split(' ')\n  .filter((w) => w.length >= 4 && !NOT_DISTINCTIVE.has(w));\n\n// Host without \"www.\" and without its last label, squashed: testvikhouse.no\n// -> \"testvikhouse\". Regex only - the Code node sandbox has no URL global.\nconst hostOf = (url) => String(url || '').trim()\n  .replace(/^[a-z][a-z0-9+.-]*:\\/\\//i, '')\n  .split(/[/?#]/)[0].split('@').pop().split(':')[0]\n  .toLowerCase().replace(/^www\\./, '');\nconst stemOf = (host) => host.split('.').slice(0, -1).join('').replace(/[^a-z0-9]/g, '');\nconst carriesName = (s) => nameTokens.some((t) => s.includes(t));\n\n// Free and ISP mailboxes - including the UAE's eim.ae and emirates.net.ae,\n// which is where many Dubai listings' addresses live.\nconst FREE_MAIL = /^(gmail|googlemail|hotmail|outlook|live|msn|yahoo|ymail|icloud|me|aol|proton|protonmail|gmx|yandex|mail|online|getmail|eim|emirates)\\./;\n\nif (email && EMAIL_RE.test(email)) {\n  const [localPart, domain] = email.toLowerCase().split('@');\n  const siteHost = hostOf(b.website_url);\n  const siteNamed = Boolean(siteHost) && carriesName(stemOf(siteHost));\n  let belongs;\n  // An email published on THIS business's own listing (the Overture record\n  // CH-00 found it on) is theirs by provenance, whatever its spelling -\n  // most are gmail addresses that carry no part of the trading name.\n  // Even when the domain IS their proven site: a restaurant's info@ on its\n  // own proven domain was exactly that, and bounced. A listing's company address is often a\n  // mailbox nobody set up or kept. Only an address read off their own site\n  // (Stage F) or a business-shaped free mailbox goes out on its own.\n  if (b.email_source === 'listing' && !FREE_MAIL.test(domain)) {\n    // A listing address on a company domain whose website we never found:\n    // the domain is often bought and abandoned, or the mailbox long gone.\n    // Found for real - a building-management company's listed address\n    // bounced \"address not found\" within a minute. Bounces are what ruin a sending domain, so\n    // these wait for a human rather than go out on their own.\n    belongs = true;   // provenance is fine; the risk is the mailbox, reported here\n    problems.push(`${email} is a listing address on ${domain}, where no website of theirs was found - ` +\n      'high bounce risk, check the address before approving');\n  } else if (b.email_source === 'listing' && FREE_MAIL.test(domain)\n             && !carriesName(localPart.replace(/[^a-z0-9]/g, ''))) {\n    // A free mailbox on the listing that carries no part of the business\n    // name - digits only, initials and digits, a person's name - is often\n    // someone's old personal address. The first day's bounces were all of\n    // this kind, while every address shaped like the business (the salon's\n    // or restaurant's own name, at a free mailbox) arrived.\n    // Held, not sent: bounces are what cost a sending domain its inbox.\n    belongs = true;   // provenance is fine; the risk is the mailbox\n    problems.push(`${email} is a listing address that carries no part of the business name - ` +\n      'often an old personal mailbox, high bounce risk; check it before approving');\n  } else if (b.email_source === 'listing') {\n    belongs = true;\n  } else if (!nameTokens.length) {\n    belongs = false;\n  } else if (FREE_MAIL.test(domain)) {\n    belongs = carriesName(localPart.replace(/[^a-z0-9]/g, '')) || siteNamed;\n  } else {\n    belongs = carriesName(stemOf(domain))\n      || (siteNamed && (domain === siteHost || domain.endsWith('.' + siteHost)));\n  }\n  if (!belongs) {\n    problems.push(nameTokens.length\n      ? `${email} does not carry the business name, so it may belong to a different ` +\n        `business (a neighbour sharing their phone number, or a directory) - check before approving`\n      : `\"${b.name}\" has no distinctive word to check ${email} against - ` +\n        `cannot tell whether that address is theirs`);\n  }\n}\n\n// --- 5a. In a consent country, only the company's shared address -----------\n//\n// Even for a company, Norwegian guidance (Forbrukertilsynet) treats an\n// employee's own address - ola.nordmann@<company>.no - as the person's, needing\n// their prior consent. A shared address (post@, info@, kontakt@) or one that\n// is the business's own name may be emailed.\nconst GENERIC_LOCAL = /^(post|postmottak|firmapost|info|kontakt|contact|mail|epost|e-post|hei|hallo|hello|hi|booking|bestilling|bestill|timebestilling|salg|sales|office|kontor|resepsjon|reception|admin|administrasjon|service|kundeservice|support|team|butikk|shop|ordre|order|faktura|regnskap|inquiries|enquiries|marketing)$/;\nif (b.consent_rule === 'consent' && email && EMAIL_RE.test(email)) {\n  const local = email.toLowerCase().split('@')[0];\n  if (!GENERIC_LOCAL.test(local) && !carriesName(local.replace(/[^a-z0-9]/g, ''))) {\n    problems.push(`${email} looks like a person's own address - in ${b.country || 'this country'} that needs their ` +\n      `prior consent; only a shared company address (post@, info@...) or one in the business's name may be emailed`);\n  }\n}\n\n// --- 5b. Is the website the pitch is about really THEIRS? ------------------\n//\n// A WEAK_WEBSITE pitch criticises a specific site, and the address came off\n// that site. If nothing ties the site to this business except its name, it\n// may be a same-named company elsewhere - an Oslo trading AS was drafted\n// against the site of a same-named fuel company in Slovakia. CH-02 records\n// whether the site carried their phone number or street address, or whether\n// the Maps listing itself linked it; anything weaker is held for a human.\n// Undefined (a caller that does not supply it) is treated as unknown, not\n// as proof.\nif (b.website_url && b.website_status === 'WEAK_WEBSITE'\n    && !['phone', 'address', 'listing'].includes(b.site_corroborated)) {\n  problems.push(`${b.website_url} matched \"${b.name}\" by name only - neither their phone number ` +\n    `nor their address appears on it, so it may be a different company with the same name`);\n}\n\n// --- 6. Build the substitutions ---------------------------------------------\n//\n// greeting_name: always the generic \"there\". The job-hunt guard's hardest\n// lesson was that a GUESSED name is worse than no name - \"the clearest\n// possible sign the sender never looked\" - and detected_person_name is a\n// guess: a capitalised run of words in a business name. It produced\n// \"Hi <district>,\" for an apartment company named after its district and\n// \"Hi The,\" for one called \"The ... company\". A human who knows the owner's\n// name can edit it in before approving.\nconst greetingName = ' there';\n\n// business_name: the trading name, without the location Google Maps appends\n// to a listing (\"Testvik House Apartments - Eksempelgata 2\", \"Lumi Beauty\n// Salon | Example District\") and without stray wrapping quotes. Nobody writes\n// their own business name with their street address on the end.\nconst tradingName = String(b.name || '').trim()\n  .replace(/^[\"'\\u201c\\u201d]+|[\"'\\u201c\\u201d]+$/g, '')\n  .split(/\\s+[|\\u2013\\u2014-]\\s+/)[0]\n  .replace(/_+/g, ' ')\n  .trim();\n\n// social_note: only rendered when a social profile was actually found, and\n// names the specific platform rather than a vague \"your socials\". It reads\n// as part of \"while looking at ... and saw your Instagram page, but I\n// couldn't find a website for you.\"\nlet socialNote = '';\nconst socials = b.social_profiles || {};\nconst platform = Object.keys(socials).find((k) => k !== 'other');\nif (platform) {\n  const label = platform.charAt(0).toUpperCase() + platform.slice(1);\n  socialNote = ` and saw your ${label} page`;\n}\n\n// business_type: what to call them, from their own category - \"hair salons\n// in Oslo\", \"garages in Dubai\" - so the message reads as written to them and\n// not to \"local businesses\". Falls back to the niche, then to the generic.\nconst TYPES = [\n  [/hair_salon/, 'hair salon', 'hair salons'],\n  [/barber/, 'barber shop', 'barber shops'],\n  [/nail_salon/, 'nail salon', 'nail salons'],\n  [/spa|massage/, 'spa', 'spas'],\n  [/beauty|skin_care|makeup|tanning|waxing|hair_removal|hair_extensions/, 'beauty salon', 'beauty salons'],\n  [/real_estate|property|^real estate$/, 'real estate agency', 'real estate agencies'],\n  [/restaurant/, 'restaurant', 'restaurants'],\n  [/cafe|coffee/, 'cafe', 'cafes'],\n  [/bakery/, 'bakery', 'bakeries'],\n  [/automotive_repair|auto_detailing/, 'garage', 'garages'],\n  [/car_dealer/, 'car dealership', 'car dealerships'],\n  [/car_rental/, 'car rental company', 'car rental companies'],\n  [/yoga/, 'yoga studio', 'yoga studios'],\n  [/gym|fitness/, 'gym', 'gyms'],\n  [/dentist/, 'dental clinic', 'dental clinics'],\n  [/medical|doctor|physical_therapy|clinic|veterinar/, 'clinic', 'clinics'],\n  [/travel/, 'travel agency', 'travel agencies'],\n  [/event|party/, 'event company', 'event companies'],\n  [/furniture/, 'furniture store', 'furniture stores'],\n  [/jewelry/, 'jewellery store', 'jewellery stores'],\n  [/clothing|tailor/, 'boutique', 'boutiques'],\n  [/photograph/, 'photography studio', 'photography studios'],\n  [/interior_design/, 'interior design studio', 'interior design studios'],\n  [/contractor|plumbing|electrician|cleaning/, 'service company', 'service companies'],\n  [/florist/, 'florist', 'florists'],\n  [/pet_groomer/, 'pet groomer', 'pet groomers'],\n  [/tutoring|language_school|driving_school|education/, 'training centre', 'training centres'],\n  [/accountant/, 'accounting firm', 'accounting firms'],\n  [/lawyer/, 'law firm', 'law firms'],\n];\nconst typeKey = String(b.category_primary || '').toLowerCase();\nconst nicheKey = String(b.niche || '').toLowerCase();\nconst typed = TYPES.find(([re]) => typeKey && re.test(typeKey))\n  || TYPES.find(([re]) => nicheKey && re.test(nicheKey.replace(/s$/, '').replace(/ /g, '_')))\n  || [null, 'local business', 'local businesses'];\n\n// weak_reason: the MEASURED reason a site counts as weak, in plain words.\n// A generic \"could be working harder\" claim to a site that is fine is the\n// fastest way to be ignored - or reported.\nconst psi = Number(b.psi_performance);\nlet weakReason = 'It looks like it could be doing more to bring you customers, especially on a phone.';\nif (psi > 0 && psi < 50) {\n  weakReason = `On a phone it loads slowly - Google's own PageSpeed test scores it ${Math.round(psi)}/100 ` +\n    'for mobile, and most of your visitors will be on a phone.';\n} else if (/wixsite\\.com|blogspot\\.com|godaddysites\\.com|webnode|jimdosite/.test(String(b.website_url || ''))) {\n  weakReason = \"It's on a free website-builder address rather than your own domain, which makes it \" +\n    'harder for customers to find you and to trust the site.';\n}\n\nconst SUBS = {\n  business_name: tradingName || 'your business',\n  greeting_name: greetingName,\n  social_note: socialNote,\n  business_type: typed[1],\n  business_type_plural: typed[2],\n  in_city: b.city ? ` in ${String(b.city).trim()}` : '',\n  weak_reason: weakReason,\n};\n// A follow-up's subject is 'Re: ' + what step 1 actually went out with. Left\n// out when unknown, so {{first_subject}} stays unfilled and the draft is held\n// rather than sent as 'Re: '.\nif (b.first_subject) SUBS.first_subject = String(b.first_subject).replace(/^\\s*(re:\\s*)+/i, '');\n\nconst fill = (tpl) =>\n  String(tpl || '').replace(/\\{\\{(\\w+)\\}\\}/g, (m, key) =>\n    Object.prototype.hasOwnProperty.call(SUBS, key) ? SUBS[key] : m);\n\nconst subject = fill(b.template_subject);\nconst body = fill(b.template_body);\n\n// Templates are single-phrasing text. A \"{a|b}\" alternatives group is not\n// rendered, so a template written that way would go out with the braces in\n// it - held rather than sent broken.\nif (/\\{[^{}]*\\|[^{}]*\\}/.test(subject) || /\\{[^{}]*\\|[^{}]*\\}/.test(body)) {\n  problems.push('template contains an {a|b} alternatives group, which is not rendered - ' +\n    'rewrite it as one phrasing');\n}\n\n// --- 7. Nothing left unfilled ------------------------------------------------\n//\n// The single most important check in this file. A template placeholder that\n// made it past `fill()` unfilled means a field this business does not have -\n// and the job-hunt project's own rule applies directly here: \"contains an\n// unfilled [placeholder]\" was one of its first checks, for exactly this\n// reason.\nif (/\\{\\{\\w+\\}\\}/.test(subject) || /\\{\\{\\w+\\}\\}/.test(body)) {\n  problems.push('template has an unfilled placeholder');\n}\n\nif (body.length < 40) {\n  problems.push('rendered body is suspiciously short');\n}\n\nconst status = problems.length ? 'needs_review' : 'draft';\n\nreturn {\n  json: {\n    business_id: b.id,\n    template_id: b.template_id,\n    sequence_step: b.sequence_step,\n    to_email: email,\n    subject,\n    body,\n    status,\n    review_reason: problems.length ? problems.join('; ') : null,\n    guard_flags: { problems, greeting_name: greetingName.trim(), social_note: Boolean(socialNote) },\n  },\n};\n"
+      },
+      "id": "ch04-render",
+      "name": "Render the draft and guard it",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-04: store the drafted message.\n--\n-- ON CONFLICT DO NOTHING, not DO UPDATE. The unique index on\n-- (business_id, sequence_step) means a re-run of CH-04 cannot draft the same\n-- step twice - but if it already exists, a human may have since moved it to\n-- 'approved' or 'needs_review' with their own notes, and this must never\n-- overwrite that. A re-drafted message replacing one a human already acted on\n-- is the outreach equivalent of the job-hunt project's \"Flow 02 mapped\n-- Status: 'queued' and reset rows already marked sent.\"\n--\n-- Auto-approval (the tenth parameter, CH-04's Config auto_approve): a draft\n-- that passed EVERY guard in render-outreach-draft.js goes straight to\n-- 'approved', which is what CH-05 sends from. Anything a guard held stays\n-- 'needs_review' whatever this flag says - a natural person in a consent\n-- country, an address that may belong to someone else, an unfilled\n-- placeholder. Switching auto_approve off returns to drafting for a human.\n\nINSERT INTO outreach\n  (business_id, template_id, sequence_step, to_email, subject, body, status,\n   review_reason, guard_flags, approved_at, approved_by)\nVALUES\n  ($1, $2, $3, $4, $5, $6,\n   CASE WHEN $7 = 'draft' AND $10::boolean THEN 'approved' ELSE $7 END,\n   $8, $9::jsonb,\n   CASE WHEN $7 = 'draft' AND $10::boolean THEN now() END,\n   CASE WHEN $7 = 'draft' AND $10::boolean THEN 'auto: passed every CH-04 guard' END)\nON CONFLICT (business_id, sequence_step) DO NOTHING\nRETURNING id, status;\n",
+        "options": {
+          "queryReplacement": "={{ [$json.business_id, $json.template_id, $json.sequence_step, $json.to_email, $json.subject, $json.body, $json.status, $json.review_reason || '', JSON.stringify($json.guard_flags), $('Config').first().json.auto_approve ? 'true' : 'false'] }}"
+        }
+      },
+      "id": "ch04-insert",
+      "name": "Insert the draft",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        540,
+        380
+      ],
+      "notes": "ON CONFLICT DO NOTHING - a re-run cannot draft the same step twice, and cannot overwrite a status a human already changed.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-04, node: \"What did drafting produce?\"\n// Mode: Run Once for All Items\n\nconst rows = $('Insert the draft').all().map((i) => i.json).filter((r) => r && r.id);\n\nif (!rows.length) {\n  // Nothing to draft is the normal state once every qualified, emailed lead\n  // already has whatever step is next in flight. Not a fault.\n  return [{ json: { quiet: true, message: 'CH-04: nothing due to draft right now.' } }];\n}\n\nconst approved = rows.filter((r) => r.status === 'approved').length;\nconst drafts = rows.filter((r) => r.status === 'draft').length;\nconst review = rows.filter((r) => r.status === 'needs_review').length;\n\nconst lines = [`CH-04 drafted ${rows.length}`];\nif (approved) lines.push(`  ${approved} passed every guard - queued for CH-05 to send in business hours`);\nif (drafts) lines.push(`  ${drafts} ready for review`);\nif (review) lines.push(`  ${review} held (needs a decision - nothing held is ever sent automatically)`);\n\n// Quiet since 5 Oct 2026, at the owner's request: a message per run (every\n// 10 minutes) buried the ones that matter. CH-07's twice-daily digest\n// reports what this produced.\nreturn [{ json: { quiet: true, total: rows.length, approved, drafts, review, message: lines.join('\\n') } }];\n"
+      },
+      "id": "ch04-summary",
+      "name": "What did drafting produce?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cw1",
+              "leftValue": "={{ $json.quiet }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch04-worth-saying",
+      "name": "Is this worth a message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        980,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch04-telegram",
+      "name": "Tell me",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1200,
+        380
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-04 \u2014 Prepare outreach\n\n**This workflow never sends anything.** It writes rows to the `outreach` table with status `draft` or `needs_review`. CH-04 is the only workflow with an SMTP node, and CH-04 only sends a row a human has set to `approved`.\n\n### Why a row gets held instead of drafted clean\n\n- **No email found** \u2014 not actually possible to reach here (see `select-outreach-candidates.sql`: a business with no email is not selected in the first place).\n- **Natural person detected** \u2014 the business name appears to embed a real person's name, and their country either requires prior consent for marketing to a natural person, or its law simply has not been checked yet. Both hold, on purpose: absence of a country from `consent_required_countries` means unverified, not cleared.\n- **Unfilled template placeholder** \u2014 a `{{field}}` survived rendering, which means the business is missing something the template assumed it had.\n\n### Approving a draft\n\nThere is deliberately no UI for this yet. Approve one by hand:\n\n```sql\nUPDATE outreach SET status = 'approved', approved_at = now(), approved_by = 'you'\nWHERE id = <the row id>;\n```\n\nReview what is waiting first:\n\n```sql\nSELECT o.id, b.name, o.to_email, o.status, o.review_reason, o.subject\nFROM outreach o JOIN businesses b ON b.id = o.business_id\nWHERE o.status IN ('draft','needs_review')\nORDER BY o.created_at;\n```\n\n### The templates are data, not code\n\nEdit `outreach_templates` directly \u2014 no node needs touching:\n\n```sql\nUPDATE outreach_templates SET subject = '...', body = '...'\nWHERE slug = 'default' AND sequence_step = 1;\n```",
+        "height": 760,
+        "width": 640,
+        "color": 6
+      },
+      "id": "ch04-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1480,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Every 10 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Load consent-required countries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load consent-required countries": {
+      "main": [
+        [
+          {
+            "node": "Who is due a message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Who is due a message?": {
+      "main": [
+        [
+          {
+            "node": "Is this a natural person or a trading name?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is this a natural person or a trading name?": {
+      "main": [
+        [
+          {
+            "node": "Cache the natural-person flag",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Render the draft and guard it",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render the draft and guard it": {
+      "main": [
+        [
+          {
+            "node": "Insert the draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert the draft": {
+      "main": [
+        [
+          {
+            "node": "What did drafting produce?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What did drafting produce?": {
+      "main": [
+        [
+          {
+            "node": "Is this worth a message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is this worth a message?": {
+      "main": [
+        [
+          {
+            "node": "Tell me",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  }
+}

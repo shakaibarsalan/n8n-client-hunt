@@ -1,0 +1,175 @@
+{
+  "name": "CH-00 Client Hunt - Discover from open data",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "ch00-trigger-schedule",
+      "name": "Every 6 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ch00-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1",
+              "name": "per_target_per_run",
+              "value": 10,
+              "type": "number"
+            },
+            {
+              "id": "f2",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "q3",
+              "name": "stop_when_pending_above",
+              "value": 150,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch00-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "per_target_per_run x 4 runs a day x enabled targets = leads a day. The real limit is downstream: CH-02 verifies about 720 a day, and every lead costs one or two Serper searches from the free 2,500."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-00: take new leads from the Overture places already loaded - free.\n--\n-- For every enabled search target whose city has reference data, picks up to\n-- the first parameter's worth of places that:\n--   * fall in one of the niche's Overture categories (niche_categories - data,\n--     so a new niche is an INSERT, not a code change)\n--   * have a phone number (every channel this project uses needs one)\n--   * hold no website in Overture - or only links that are not a site of\n--     their own: a social page, a delivery app, a directory, or a Google\n--     business.site page (all shut down in 2024). Which hosts count is the\n--     platform_domains TABLE, the same list Stage A judges them by.\n--   * are not closed\n--   * are not already a business here - by place id, phone, or name + location\n-- most confident first, and stores them PENDING so CH-02 verifies them like\n-- any other lead. Nothing here decides \"no website\": the dataset's empty\n-- website field is Stage A's starting claim, nothing more, and Stage B is\n-- kept from matching a lead against its own Overture record.\n--\n-- google_place_id is 'ovt:' + the Overture id. It is the dedup key every\n-- other query uses, and the prefix keeps it from ever colliding with a real\n-- Google place id.\n\nWITH targets AS (\n  SELECT t.id, t.niche, t.city, t.country, upper(t.country_code) AS country_code,\n         (SELECT array_agg(nc.category) FROM niche_categories nc WHERE nc.niche = t.niche) AS cats\n  FROM search_targets t\n  WHERE t.enabled\n    AND EXISTS (SELECT 1 FROM ref_overture_places o WHERE lower(o.load_city) = lower(t.city))\n    -- Nothing new while CH-02 already has $2 or more waiting: it verifies on\n    -- demand now (select-pending.sql), so a growing PENDING pile is only\n    -- leads that will go stale before anyone looks at them.\n    AND (SELECT count(*) FROM businesses WHERE website_status = 'PENDING') < $2::int\n),\n\npicked AS (\n  SELECT DISTINCT ON (o.gers_id)\n    t.id AS target_id, t.niche, t.city, t.country, t.country_code,\n    o.gers_id, o.name, o.name_norm, o.categories, o.address, o.lat, o.lon,\n    o.geohash7, o.phone_e164, o.socials, o.confidence, o.email, o.listed_site\n  FROM targets t\n  CROSS JOIN LATERAL (\n    SELECT o.*,\n      -- The listing's own email, when it carries a usable one. A data broker's\n      -- address (bisnode) is the broker, not the business.\n      (SELECT lower(e) FROM unnest(o.emails) AS e\n        WHERE e ~* '^[a-z0-9._%+-]+@[a-z0-9.-]+[.][a-z]{2,}$'\n          AND e !~* '@(bisnode|example|sentry|wixpress)[.]'\n        LIMIT 1) AS email,\n      -- The link the listing holds instead of a website, dead business.site\n      -- first: Stage A reads it from raw.website, and CH-04 picks its pitch\n      -- from it.\n      (SELECT s FROM unnest(o.websites) AS s\n        ORDER BY (s ~* '(^|[/.])business[.]site') DESC LIMIT 1) AS listed_site\n    FROM ref_overture_places o\n    WHERE lower(o.load_city) = lower(t.city)\n      AND t.cats IS NOT NULL\n      AND o.categories && t.cats\n      AND o.phone_e164 IS NOT NULL AND o.phone_e164 <> ''\n      AND NOT EXISTS (\n        SELECT 1 FROM unnest(o.websites) AS s\n        CROSS JOIN LATERAL (SELECT lower(substring(s FROM '^(?:[a-z]+://)?(?:www[.])?([^/:?#]+)')) AS host) h\n        WHERE NOT EXISTS (\n          SELECT 1 FROM platform_domains pd\n          WHERE pd.active AND (h.host = pd.domain OR right(h.host, length(pd.domain) + 1) = '.' || pd.domain)))\n      AND coalesce(o.operating_status, 'open') NOT IN ('closed', 'permanently_closed')\n      AND coalesce(o.name_norm, '') <> ''\n      -- Not prospects for a small-business website, whatever their category:\n      -- housing co-ops (sameie, borettslag), car parks, places of worship,\n      -- official bodies, associations. Found in the first batch's queue.\n      AND o.name !~* '(sameie|borettslag|parkering|parking|mosque|masjid|embassy|consulate|ministry|government|municipality|kommune|forening|association|residence|townhouse|bed ?space|partition|hostel|accommodation|labou?r camp)'\n      -- A name that is only a street address (\"Eksempelgata 7\") is a property\n      -- advert, not a business - they came in with finn.no links.\n      AND o.name !~* '^[^0-9]*(gate|gata|veien|vei|vegen|street|road) [0-9]+[a-z]?$'\n      AND NOT EXISTS (\n        SELECT 1 FROM businesses b\n        WHERE b.google_place_id = 'ovt:' || o.gers_id\n           OR b.phone_e164 = o.phone_e164\n           OR (b.name_norm = o.name_norm AND b.geohash7 = o.geohash7))\n    -- Places whose listing carries an email first: without one, the only\n    -- channel is the phone, and that is what the call list is for.\n    -- A dead Google site next: the strongest true thing we can tell them.\n    ORDER BY (cardinality(o.emails) > 0) DESC, coalesce((SELECT bool_or(s ~* '(^|[/.])business[.]site') FROM unnest(o.websites) AS s), false) DESC,\n             o.confidence DESC NULLS LAST, o.gers_id\n    LIMIT $1::int\n  ) o\n  ORDER BY o.gers_id\n),\n\nstored AS (\n  INSERT INTO businesses (\n    google_place_id, search_target_id, niche, name, name_norm,\n    category_primary, categories, address, city, country, country_code,\n    lat, lon, geohash7, phone_raw, phone_e164, email, social_profiles, raw, source)\n  SELECT\n    'ovt:' || p.gers_id, p.target_id, p.niche, p.name, p.name_norm,\n    p.categories[1], p.categories, p.address, p.city, p.country, p.country_code,\n    p.lat, p.lon, p.geohash7, p.phone_e164, p.phone_e164, p.email,\n    coalesce((\n      SELECT jsonb_object_agg(k, s) FROM (\n        SELECT DISTINCT ON (k) s,\n          CASE WHEN s ~* 'facebook' THEN 'facebook'\n               WHEN s ~* 'instagram' THEN 'instagram'\n               WHEN s ~* 'linkedin' THEN 'linkedin'\n               ELSE 'other' END AS k\n        FROM unnest(p.socials) AS s WHERE coalesce(s, '') <> '') x), '{}'::jsonb),\n    jsonb_build_object('source', 'overture', 'gers_id', p.gers_id, 'website', coalesce(p.listed_site, ''),\n                       'overture_confidence', p.confidence,\n                       'email_source', CASE WHEN p.email IS NOT NULL THEN 'listing' END),\n    'overture'\n  FROM picked p\n  ON CONFLICT DO NOTHING\n  RETURNING search_target_id\n)\n\nSELECT t.id AS target_id, t.niche, t.city,\n       (SELECT count(*) FROM stored s WHERE s.search_target_id = t.id) AS added\nFROM targets t\nORDER BY t.id;\n",
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.per_target_per_run, $('Config').first().json.stop_when_pending_above] }}"
+        }
+      },
+      "id": "ch00-insert",
+      "name": "Take new leads from open data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-00, node: \"What did we add?\"\n// Mode: Run Once for All Items\n//\n// One line per target that gained leads. Nothing added is the normal state\n// once a city's matching places are used up, and says nothing - an empty\n// return ends the run quietly instead of sending \"0 new\" four times a day.\n\nconst rows = $('Take new leads from open data').all().map((i) => i.json)\n  .filter((r) => r && r.target_id != null);\n\nconst added = rows.filter((r) => Number(r.added) > 0);\nif (!added.length) return [];\n\nconst total = added.reduce((n, r) => n + Number(r.added), 0);\nconst lines = [`CH-00 added ${total} lead(s) from open data, free - CH-02 verifies them next:`];\nfor (const r of added) lines.push(`  ${r.niche} - ${r.city}: ${r.added}`);\n\nreturn [{ json: { total, message: lines.join('\\n') } }];\n"
+      },
+      "id": "ch00-summary",
+      "name": "What did we add?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## CH-00 \u2014 Discover from open data\n\nFree discovery. Takes leads from the Overture places already loaded for each enabled target's city: in the niche's categories (`niche_categories`), with a phone, holding no website, not closed, and not already a business here.\n\nThey are stored `PENDING` with source `overture`, and CH-02 verifies them exactly like an Apify lead - search, domain probes, PageSpeed. Stage B is kept from matching a lead against its own Overture record, so the dataset never vouches for itself.\n\nOnly cities with reference data are used (Oslo and Dubai today). Load another with `tools/load_reference_data.py`.\n\nCosts nothing to run. The real limits are CH-02's pace and Serper's free search credits.",
+        "height": 440,
+        "width": 560,
+        "color": 4
+      },
+      "id": "ch00-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1420,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Every 6 hours": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Take new leads from open data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Take new leads from open data": {
+      "main": [
+        [
+          {
+            "node": "What did we add?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

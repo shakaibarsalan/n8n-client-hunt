@@ -1,0 +1,552 @@
+{
+  "name": "CH-05 Client Hunt - Send approved outreach",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "ch05-trigger-schedule",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        120
+      ],
+      "notes": "Sends at most ONE message per run. With the 5-minute minimum gap and the daily cap, the brake - not this schedule - decides how fast mail goes out."
+    },
+    {
+      "parameters": {},
+      "id": "ch05-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d1",
+              "name": "max_per_day",
+              "value": 30,
+              "type": "number"
+            },
+            {
+              "id": "d2",
+              "name": "min_gap_minutes",
+              "value": 3,
+              "type": "number"
+            },
+            {
+              "id": "d3",
+              "name": "max_bounces",
+              "value": 8,
+              "type": "number"
+            },
+            {
+              "id": "d4",
+              "name": "business_hours_json",
+              "value": "{\"no\":[9,18],\"se\":[9,18],\"dk\":[9,18],\"ae\":[9,19],\"qa\":[9,19]}",
+              "type": "string"
+            },
+            {
+              "id": "d5",
+              "name": "from_email",
+              "value": "__ENV:OUTREACH_USER__",
+              "type": "string"
+            },
+            {
+              "id": "d6",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "d7",
+              "name": "copy_to",
+              "value": "__ENV:OUTREACH_USER__",
+              "type": "string"
+            },
+            {
+              "id": "d8",
+              "name": "from_name",
+              "value": "Alex from Example Web Studio",
+              "type": "string"
+            },
+            {
+              "id": "d9",
+              "name": "warmup_start",
+              "value": 20,
+              "type": "number"
+            },
+            {
+              "id": "d10",
+              "name": "warmup_step",
+              "value": 10,
+              "type": "number"
+            },
+            {
+              "id": "d11",
+              "name": "reoon_api_key",
+              "value": "__ENV:REOON_API_KEY__",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch05-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "Sends on its own. Daily cap = min(max_per_day, warmup_start + warmup_step x days since the first send). max_per_day is 30 since 6 Oct 2026: published cold-email data puts the safe volume for one mailbox at about 30 a day while a domain is young, and replies peak at 20-49 a day per sender (Instantly, Hunter). More volume should come from a second mailbox, not from pushing this one to 100. from_name is who the mail is from in the inbox: a person at the company, so it reads as one-to-one - the owner's choice on 6 Oct 2026 (it was the company name before). max_bounces was 5 until 6 Oct 2026, when every first message started going through a Reoon mailbox check (\"Is the mailbox real?\"): the five bounces before that were all unchecked directory addresses, so the floor was raised to 8 to let checked mail resume; 3 more bounces with checking in place still stop everything."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "select-send-stats.sql"
+        },
+        "options": {}
+      },
+      "id": "ch05-stats",
+      "name": "How is the sender doing?",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "select-next-approved.sql"
+        },
+        "options": {}
+      },
+      "id": "ch05-next",
+      "name": "Next approved message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        290
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "brake-may-we-send.js"
+        }
+      },
+      "id": "ch05-brake",
+      "name": "BRAKES: may we send this one?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e1",
+              "leftValue": "={{ $json.send }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch05-gate",
+      "name": "Cleared to send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        340,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "verify-mailbox.js"
+        }
+      },
+      "id": "ch05-verify-mailbox",
+      "name": "Is the mailbox real?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        130
+      ],
+      "notes": "Reoon power-mode check of the address before the first message to it. Only 'send' goes on; a failed check sends nothing and leaves the message approved."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e3",
+              "leftValue": "={{ $json.verdict }}",
+              "rightValue": "send",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch05-mailbox-gate",
+      "name": "Real mailbox?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        780,
+        130
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config').first().json.from_name + ' <' + $('Config').first().json.from_email + '>' }}",
+        "toEmail": "={{ $json.to_email }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false,
+          "bccEmail": "={{ $('Config').first().json.copy_to }}"
+        }
+      },
+      "id": "ch05-send",
+      "notes": "BCC goes to our own mailbox. SMTP never writes a copy into the Sent folder - only a mail client does - so without this, outbound mail is invisible in the inbox the replies arrive in. The copy arrives FROM our own address, which CH-06 ignores, so it can never be mistaken for a reply.",
+      "name": "Send it",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1020,
+        60
+      ],
+      "credentials": {
+        "smtp": {
+          "name": "Client Hunt SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "mark-outreach-sent.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$('BRAKES: may we send this one?').first().json.id, $json.messageId || '', $('Is the mailbox real?').first().json.mailbox || ''] }}"
+        }
+      },
+      "id": "ch05-mark",
+      "name": "Mark it sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1240,
+        60
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "hold-unverified-mailbox.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.verdict, $json.reason, $json.mailbox || ''] }}"
+        }
+      },
+      "id": "ch05-hold-unverified",
+      "name": "Hold or drop it",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1020,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e2",
+              "leftValue": "={{ $json.alert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch05-alert-gate",
+      "name": "Worth an alarm?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        340,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "=CH-05 did not send: {{ $json.reason }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch05-alarm-telegram",
+      "name": "Say why we stopped",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        580,
+        420
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-05 \u2014 Send approved outreach\n\n**Sends on its own, every 5 minutes - one message per run.** It sends the oldest row with `status = 'approved'`: CH-04 approves a draft automatically only when it passed every guard; anything held stays `needs_review` and is never sent unless a human approves it.\n\n### The brake, every run\n\n1. Bounce circuit breaker \u2014 8 bounces in 7 days (or 8% of sends) stops everything.\n2. Daily cap \u2014 100/day (owner's instruction).\n3. Every precondition re-checked at send time: suppression, closure, natural-person flag.\n4. Minimum gap since the last send.\n5. Not at the weekend, and inside business hours, in the **recipient's** country.\n6. **Is the mailbox real?** \u2014 Reoon checks the address before the first message. Only a confirmed mailbox is sent; a dead one is skipped and suppressed, an unconfirmable one held for review, and a failed check sends nothing.\n\nEvery send is BCC'd to our own mailbox and reported on Telegram. CH-06 marks replies and bounces and stops the follow-up.\n\nTo stop all sending: unpublish this workflow, or set CH-04's `auto_approve` to false.",
+        "height": 620,
+        "width": 620,
+        "color": 3
+      },
+      "id": "ch05-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1480,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "How is the sender doing?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "How is the sender doing?": {
+      "main": [
+        [
+          {
+            "node": "Next approved message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Next approved message": {
+      "main": [
+        [
+          {
+            "node": "BRAKES: may we send this one?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BRAKES: may we send this one?": {
+      "main": [
+        [
+          {
+            "node": "Cleared to send?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Worth an alarm?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleared to send?": {
+      "main": [
+        [
+          {
+            "node": "Is the mailbox real?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send it": {
+      "main": [
+        [
+          {
+            "node": "Mark it sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Worth an alarm?": {
+      "main": [
+        [
+          {
+            "node": "Say why we stopped",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is the mailbox real?": {
+      "main": [
+        [
+          {
+            "node": "Real mailbox?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Real mailbox?": {
+      "main": [
+        [
+          {
+            "node": "Send it",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Hold or drop it",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Worth an alarm?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

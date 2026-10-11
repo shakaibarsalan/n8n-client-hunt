@@ -1,0 +1,540 @@
+{
+  "name": "CH-05 Client Hunt - Send approved outreach",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "ch05-trigger-schedule",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        120
+      ],
+      "notes": "Sends at most ONE message per run. With the 5-minute minimum gap and the daily cap, the brake - not this schedule - decides how fast mail goes out."
+    },
+    {
+      "parameters": {},
+      "id": "ch05-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d1",
+              "name": "max_per_day",
+              "value": 30,
+              "type": "number"
+            },
+            {
+              "id": "d2",
+              "name": "min_gap_minutes",
+              "value": 3,
+              "type": "number"
+            },
+            {
+              "id": "d3",
+              "name": "max_bounces",
+              "value": 8,
+              "type": "number"
+            },
+            {
+              "id": "d4",
+              "name": "business_hours_json",
+              "value": "{\"no\":[9,18],\"se\":[9,18],\"dk\":[9,18],\"ae\":[9,19],\"qa\":[9,19]}",
+              "type": "string"
+            },
+            {
+              "id": "d5",
+              "name": "from_email",
+              "value": "__ENV:OUTREACH_USER__",
+              "type": "string"
+            },
+            {
+              "id": "d6",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "d7",
+              "name": "copy_to",
+              "value": "__ENV:OUTREACH_USER__",
+              "type": "string"
+            },
+            {
+              "id": "d8",
+              "name": "from_name",
+              "value": "Alex from Example Web Studio",
+              "type": "string"
+            },
+            {
+              "id": "d9",
+              "name": "warmup_start",
+              "value": 20,
+              "type": "number"
+            },
+            {
+              "id": "d10",
+              "name": "warmup_step",
+              "value": 10,
+              "type": "number"
+            },
+            {
+              "id": "d11",
+              "name": "reoon_api_key",
+              "value": "__ENV:REOON_API_KEY__",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch05-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "Sends on its own. Daily cap = min(max_per_day, warmup_start + warmup_step x days since the first send). max_per_day is 30 since 6 Oct 2026: published cold-email data puts the safe volume for one mailbox at about 30 a day while a domain is young, and replies peak at 20-49 a day per sender (Instantly, Hunter). More volume should come from a second mailbox, not from pushing this one to 100. from_name is who the mail is from in the inbox: a person at the company, so it reads as one-to-one - the owner's choice on 6 Oct 2026 (it was the company name before). max_bounces was 5 until 6 Oct 2026, when every first message started going through a Reoon mailbox check (\"Is the mailbox real?\"): the five bounces before that were all unchecked directory addresses, so the floor was raised to 8 to let checked mail resume; 3 more bounces with checking in place still stop everything."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-05: what has the sender already done today, and how healthy is it?\n--\n-- Read BEFORE picking a message to send, so the brake can refuse before it\n-- ever looks at a candidate - the same ordering as CH-01's spend check.\n\nSELECT\n  (SELECT count(*) FROM outreach\n     -- Every message that LEFT today counts, whatever happened to it after:\n     -- a bounce or a reply changes its status, not the fact that it was sent.\n     -- Counting only status 'sent' let two bounces through a 20-a-day cap.\n     WHERE status IN ('sent', 'replied', 'bounced')\n       AND sent_at >= date_trunc('day', now()))                              AS sent_today,\n  (SELECT count(*) FROM outreach WHERE status = 'sent')                    AS sent_total,\n  (SELECT count(*) FROM outreach WHERE status = 'bounced')                 AS bounced_total,\n  (SELECT count(*) FROM outreach WHERE status = 'bounced'\n     AND coalesce(reply_at, sent_at) >= now() - interval '7 days')         AS bounced_7d,\n  (SELECT count(*) FROM outreach WHERE status IN ('sent', 'replied', 'bounced')\n     AND sent_at >= now() - interval '7 days')                            AS sent_7d,\n  -- When the latest bounce came in: the brake's alarm speaks only right after\n  -- a bounce, not every hour for the week a tripped brake stays tripped.\n  (SELECT max(coalesce(reply_at, sent_at)) FROM outreach\n     WHERE status = 'bounced')                                           AS last_bounced_at,\n  (SELECT max(sent_at) FROM outreach WHERE sent_at IS NOT NULL)          AS last_sent_at,\n  (SELECT min(sent_at) FROM outreach WHERE sent_at IS NOT NULL)          AS first_sent_at;\n",
+        "options": {}
+      },
+      "id": "ch05-stats",
+      "name": "How is the sender doing?",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-05: the next message a human has approved to send.\n--\n-- Re-checks suppression and closure AT SEND TIME, not just at draft time -\n-- the two can be minutes or weeks apart, and a suppression added after a\n-- draft was approved must still stop the send. Restating every precondition\n-- at the point of sending is deliberate, from the job-hunt project's own\n-- brake: \"it belongs here rather than only upstream: this is the last place\n-- before an email leaves, so a mistake anywhere earlier still cannot produce\n-- a second copy.\"\n\nSELECT\n  o.id, o.business_id, o.to_email, o.subject, o.body, o.sequence_step,\n  b.name AS business_name, b.country_code, b.is_natural_person, b.permanently_closed,\n  -- Where the address came from: the mailbox check trusts a catch-all domain\n  -- only for an address printed on the business's own website.\n  b.raw ->> 'email_source' AS email_source,\n  EXISTS (\n    SELECT 1 FROM suppression sup\n    WHERE (sup.kind = 'email' AND lower(sup.value) = lower(o.to_email))\n       OR (sup.kind = 'place_id' AND sup.value = b.google_place_id)\n  ) AS now_suppressed\nFROM outreach o\nJOIN businesses b ON b.id = o.business_id\nWHERE o.status = 'approved'\n-- Best leads first: with a daily cap, the order decides who hears from us\n-- at all. Highest current lead score, then the longest-waiting.\nORDER BY (SELECT s.total FROM lead_scores s WHERE s.business_id = o.business_id\n          ORDER BY s.scored_at DESC LIMIT 1) DESC NULLS LAST,\n         o.approved_at ASC\nLIMIT 25;\n",
+        "options": {}
+      },
+      "id": "ch05-next",
+      "name": "Next approved message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        290
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-05, node: \"BRAKES: may we send this one?\"\n// Mode: Run Once for All Items\n//\n// This workflow runs on a schedule and sends on its own: the owner asked for\n// sending without a human click, once CH-04 started auto-approving only the\n// drafts that pass every guard. That makes this node the ONLY thing between\n// the queue and a stranger's inbox, which is why every check below is\n// restated here rather than trusted from upstream, and why each run sends at\n// most one message.\n//\n// Checks run in order of what they protect against, most serious first -\n// mirroring the job-hunt project's own ordering: \"Bounces - first, because it\n// is the one that ends an account [reputation].\"\n\nconst stats = $('How is the sender doing?').first().json;\nconst CFG = $('Config').first().json;\n\n// Up to 25 approved messages, best first (select-next-approved.sql). The\n// first one that may go NOW is sent. It used to be only the top one: when\n// that was an Oslo lead before Oslo's office hours, every Dubai message\n// queued behind it waited too - a whole morning of sends lost to one row.\nconst ref = $('Next approved message');\nconst candidates = (typeof ref.all === 'function' ? ref.all().map((i) => i.json) : [ref.first().json])\n  .filter((c) => c && c.id);\n\n// CH-05 runs every 5 minutes, and an alarm that stays true (a tripped bounce\n// brake) used to message every run - about fifty Telegram messages in one\n// morning, burying everything else. An alarm now speaks at most once an\n// hour, in the first run after the hour.\nconst alarmThisRun = new Date().getUTCMinutes() < 5;\nconst stop = (reason, alert) => [{ json: { send: false, reason, alert: Boolean(alert) && alarmThisRun } }];\n\n// --- 1. Bounce circuit breaker ----------------------------------------------\n// A RATE over the last 7 days, not a lifetime count: at 100 sends a day a\n// fixed \"3 bounces ever\" would stop the pipeline for good within days on\n// ordinary stale addresses, while a real list or domain problem shows up as\n// a rate. Never below max_bounces; 8% is where mailbox providers start\n// treating a sender as a spammer. Without the 7-day fields (an older stats\n// query), the lifetime count is used, as before.\nconst maxBounces = Number(CFG.max_bounces || 3);\nconst bounces = Number(stats.bounced_7d != null ? stats.bounced_7d : (stats.bounced_total || 0));\nconst bounceLimit = Math.max(maxBounces, Math.ceil(Number(stats.sent_7d || 0) * 0.08));\nif (bounces >= bounceLimit) {\n  // A tripped brake stays tripped until the oldest bounce is a week old -\n  // days. Hourly, that was 24 messages a day saying the same thing. It now\n  // speaks in the run right after a bounce (the one that tripped it, or a\n  // later one), and the twice-daily digest repeats it. A run every 5 minutes\n  // sees a new bounce within 6 minutes; one late run costs a second message,\n  // never none.\n  const bounceAge = stats.last_bounced_at\n    ? (Date.now() - new Date(stats.last_bounced_at).getTime()) / 60000 : null;\n  const speak = bounceAge == null ? alarmThisRun : bounceAge < 6;\n  return [{ json: { send: false, alert: speak, reason:\n    `STOPPED: ${bounces} bounces in the last 7 days (limit ${bounceLimit}). ` +\n    `Something is wrong with the address list or the sending domain - check before clearing this.` } }];\n}\n\n// --- 2. Daily cap ------------------------------------------------------------\n// Warm-up: a new sending domain that goes from nothing to 100 a day is\n// treated as a spammer. The cap starts at warmup_start on the day of the\n// first send and rises by warmup_step a day until it reaches max_per_day.\nconst ceiling = Number(CFG.max_per_day || 15);\nlet maxPerDay = ceiling;\nif (stats.first_sent_at && CFG.warmup_start) {\n  const days = Math.floor((Date.now() - new Date(stats.first_sent_at).getTime()) / 86400000);\n  maxPerDay = Math.min(ceiling, Number(CFG.warmup_start) + Number(CFG.warmup_step || 0) * Math.max(0, days));\n}\nif (Number(stats.sent_today || 0) >= maxPerDay) {\n  return stop(`Daily cap reached (${stats.sent_today}/${maxPerDay}` +\n    (maxPerDay < ceiling ? `, warming up towards ${ceiling}` : '') + '). Try again tomorrow.', false);\n}\n\n// --- 3. Is there anything approved to send? ---------------------------------\nif (!candidates.length) {\n  return stop('Nothing is approved and waiting.', false);\n}\n\n// --- 4. Minimum gap since the last send -------------------------------------\nconst minGapMinutes = Number(CFG.min_gap_minutes || 5);\nif (stats.last_sent_at) {\n  const minutesSince = (Date.now() - new Date(stats.last_sent_at).getTime()) / 60000;\n  if (minutesSince < minGapMinutes) {\n    return stop(`Too soon since the last send (${minutesSince.toFixed(1)} of ${minGapMinutes} ` +\n                `minutes). Run again shortly.`, false);\n  }\n}\n\nlet hours;\ntry { hours = JSON.parse(CFG.business_hours_json || '{}'); } catch (e) { hours = {}; }\nconst nowUtc = new Date();\n\n// Why one candidate may not go right now, or null if it may.\nconst blockedBecause = (candidate) => {\n  // --- 5. Restate every precondition at the point of sending ---------------\n  //\n  // Re-checked here even though CH-04's guard already checked these, because\n  // time passes between a draft being approved and this node running - a\n  // suppression can be added, a business can close, in the gap.\n  if (candidate.now_suppressed) {\n    return { alert: true, reason: `${candidate.business_name} is now suppressed - was approved before the ` +\n      `suppression was added. Skipping, not sending.` };\n  }\n  if (candidate.permanently_closed) {\n    return { alert: true, reason: `${candidate.business_name} is now marked permanently closed.` };\n  }\n  if (candidate.is_natural_person) {\n    return { alert: true, reason: `${candidate.business_name} is flagged as a natural person. This should have ` +\n      `been held at draft time and was approved anyway - check CH-04's guard.` };\n  }\n\n  // --- 6. Business hours, in the RECIPIENT's country ------------------------\n  //\n  // The window belongs to the recipient, not to whoever clicks the button.\n  // Approximated from the recipient's UTC offset rather than a real timezone\n  // library, which a Code node does not have; a country whose offset changes\n  // with daylight saving drifts by an hour twice a year.\n  const cc = String(candidate.country_code || '').toLowerCase();\n  const offsetHours = { no: 1, se: 1, dk: 1, ae: 4, qa: 3, es: 1, pt: 0, it: 1, ca: -5 }[cc] || 0;\n  const recipientNow = new Date(nowUtc.getTime() + offsetHours * 3600000);\n\n  // --- 6a. Not at the weekend, in the RECIPIENT's country -------------------\n  //\n  // A cold email landing on a Saturday reads as sent by a machine. The\n  // weekend is not the same everywhere: the UAE moved to Saturday-Sunday in\n  // 2022, Qatar keeps Friday-Saturday.\n  const WEEKEND = { qa: [5, 6], sa: [5, 6], kw: [5, 6], om: [5, 6], bh: [5, 6] }[cc] || [6, 0];\n  if (WEEKEND.includes(recipientNow.getUTCDay())) {\n    return { alert: false, reason: `Weekend for ${candidate.country_code} - holding until the next working day.` };\n  }\n\n  // --- 6b. Business hours ---------------------------------------------------\n  const window = hours[cc];\n  if (window) {\n    const [startHour, endHour] = window;\n    const recipientHour = recipientNow.getUTCHours();\n    if (recipientHour < startHour || recipientHour >= endHour) {\n      return { alert: false, reason: `Outside business hours for ${candidate.country_code} ` +\n        `(recipient's local hour is about ${recipientHour}, window is ${startHour}-${endHour}).` };\n    }\n  }\n  return null;\n};\n\nconst blocked = [];\nfor (const candidate of candidates) {\n  const why = blockedBecause(candidate);\n  if (!why) return [{ json: { send: true, ...candidate } }];\n  blocked.push(why);\n}\n\n// Nothing may go now. An integrity problem (suppressed, closed, a natural\n// person approved) is an alarm; waiting for office hours is routine.\nconst alarm = blocked.find((b) => b.alert);\nreturn stop((alarm || blocked[0]).reason +\n  (candidates.length > 1 ? ` (none of the ${candidates.length} approved may go right now)` : ''), Boolean(alarm));\n"
+      },
+      "id": "ch05-brake",
+      "name": "BRAKES: may we send this one?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e1",
+              "leftValue": "={{ $json.send }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch05-gate",
+      "name": "Cleared to send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        340,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-05, node: \"Is the mailbox real?\"\n// Mode: Run Once for All Items\n//\n// Asks Reoon whether the mailbox exists before the FIRST message to it goes.\n// Five of the first 34 sends bounced - every one an address copied from a\n// directory listing, two of them on gmail.com with the business's own name\n// (a restaurant's <name>@gmail.com: \"The email account that you tried to reach\n// does not exist\"). No rule about how an address looks can tell a live\n// mailbox from a dead one; only asking the mail server can, and this server\n// cannot ask itself - outbound port 25 is blocked.\n//\n// Verdicts:\n//   send  - the mailbox accepts mail\n//   hold  - could not be confirmed (catch-all listing domain, unknown, full);\n//           goes to needs_review, never sent on its own\n//   drop  - the mailbox does not exist or must never be mailed; skipped and\n//           the address suppressed\n//   error - the check itself failed (key refused, credits used up, timeout).\n//           Nothing is sent and the message stays approved: an address that\n//           was never checked is never mailed.\n\nconst c = $input.first().json;\nconst CFG = $('Config').first().json;\nconst out = (verdict, reason, extra) => [{ json: { ...c, send: verdict === 'send', verdict, reason, ...(extra || {}) } }];\n\n// A follow-up goes to an address that already took our first message\n// without bouncing - CH-06 stops the sequence on a bounce. No credit spent.\nif (Number(c.sequence_step) > 1) {\n  return out('send', 'follow-up: the first message to this address was delivered', { mailbox: 'delivered before' });\n}\n\n// An alarm that stays true (credits used up for the day) would otherwise\n// message every 5 minutes. Once every 6 hours per kind of failure; workflow\n// static data survives between scheduled runs.\nconst memory = $getWorkflowStaticData('global');\nconst alarmOnce = (kind) => {\n  const last = Number((memory.mailbox_alarms || {})[kind] || 0);\n  if (Date.now() - last < 6 * 3600000) return false;\n  memory.mailbox_alarms = { ...(memory.mailbox_alarms || {}), [kind]: Date.now() };\n  return true;\n};\nconst failed = (kind, reason) => out('error', reason, { alert: alarmOnce(kind) });\n\nconst key = String(CFG.reoon_api_key || '');\nif (!key || key.startsWith('__ENV')) {\n  return failed('no-key', 'STOPPED: no Reoon key in CH-05 Config, so no address can be checked - nothing is sent unchecked.');\n}\n\nlet r;\ntry {\n  r = await this.helpers.httpRequest({\n    method: 'GET',\n    // No URL / URLSearchParams in the Code node sandbox.\n    url: 'https://emailverifier.reoon.com/api/v1/verify?email=' + encodeURIComponent(c.to_email) +\n         '&key=' + encodeURIComponent(key) + '&mode=power',\n    json: true,\n    // Power mode waits on the recipient's mail server: \"a few seconds to more\n    // than a minute\". Inside the Code node's 300s budget.\n    timeout: 120000,\n  });\n} catch (e) {\n  const msg = String((e && e.message) || e);\n  if (/status code 40[0-3]\\b/.test(msg)) {\n    return failed('refused', `STOPPED: Reoon refused the check (${msg}) - the key is wrong or the credits are used up. ` +\n      `Nothing is sent unchecked; sending resumes when checks work again.`);\n  }\n  return failed('unreachable', `Mailbox check failed for ${c.to_email} (${msg}) - will try again next run.`);\n}\n\nconst status = String((r && r.status) || '').toLowerCase();\nconst check = { mailbox: status, mailbox_score: r && r.overall_score };\n\nif (status === 'safe') return out('send', 'mailbox exists', check);\nif (status === 'role_account') {\n  // info@, sales@ - normal for a small business. Fine when deliverable.\n  return r.is_deliverable === true\n    ? out('send', 'shared mailbox (info@ etc.) that accepts mail', check)\n    : out('hold', 'shared mailbox that would not confirm delivery', check);\n}\nif (status === 'catch_all') {\n  // The domain accepts every address, so \"exists\" means nothing. Fine for an\n  // address printed on the business's own website; a directory's guess is\n  // exactly what bounced before.\n  return c.email_source === 'listing'\n    ? out('hold', 'catch-all domain, and the address came from a directory listing - cannot be confirmed', check)\n    : out('send', 'catch-all domain, address taken from their own website', check);\n}\nif (['invalid', 'disabled', 'spamtrap', 'disposable'].includes(status)) {\n  return out('drop', `mailbox check: ${status} - not sent, address suppressed`, check);\n}\nif (['unknown', 'inbox_full'].includes(status)) {\n  return out('hold', `mailbox check: ${status} - could not confirm the mailbox takes mail`, check);\n}\n// Anything else is a reply we do not understand - an error body, a changed\n// API. Treated as the check failing, never as a pass.\nreturn failed('unexpected', `STOPPED: Reoon gave an answer we do not understand ` +\n  `(${JSON.stringify(r).slice(0, 200)}) - nothing is sent unchecked.`);\n"
+      },
+      "id": "ch05-verify-mailbox",
+      "name": "Is the mailbox real?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        130
+      ],
+      "notes": "Reoon power-mode check of the address before the first message to it. Only 'send' goes on; a failed check sends nothing and leaves the message approved."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e3",
+              "leftValue": "={{ $json.verdict }}",
+              "rightValue": "send",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch05-mailbox-gate",
+      "name": "Real mailbox?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        780,
+        130
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config').first().json.from_name + ' <' + $('Config').first().json.from_email + '>' }}",
+        "toEmail": "={{ $json.to_email }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false,
+          "bccEmail": "={{ $('Config').first().json.copy_to }}"
+        }
+      },
+      "id": "ch05-send",
+      "notes": "BCC goes to our own mailbox. SMTP never writes a copy into the Sent folder - only a mail client does - so without this, outbound mail is invisible in the inbox the replies arrive in. The copy arrives FROM our own address, which CH-06 ignores, so it can never be mistaken for a reply.",
+      "name": "Send it",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1020,
+        60
+      ],
+      "credentials": {
+        "smtp": {
+          "name": "Client Hunt SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-05: record that the send actually happened.\n--\n-- The WHERE clause repeats status = 'approved' on purpose. If this workflow\n-- were somehow triggered twice at once - two manual clicks, or a schedule\n-- added later without updating this guard - both executions would pick the\n-- same \"next approved message\", but only the first UPDATE would find a\n-- matching row; the second finds it already 'sent' and updates nothing. That\n-- is the same idempotency guarantee CH-02's write-verdict.sql uses.\n\nUPDATE outreach SET\n  status  = 'sent',\n  sent_at = now(),\n  message_id = NULLIF($2, ''),\n  -- What the mailbox check said ($3), so every send carries its proof.\n  guard_flags = guard_flags || jsonb_build_object('mailbox_check', NULLIF($3::text, ''), 'mailbox_checked_at', now())\nWHERE id = $1::bigint\n  AND status = 'approved'\nRETURNING id, sent_at;\n",
+        "options": {
+          "queryReplacement": "={{ [$('BRAKES: may we send this one?').first().json.id, $json.messageId || '', $('Is the mailbox real?').first().json.mailbox || ''] }}"
+        }
+      },
+      "id": "ch05-mark",
+      "name": "Mark it sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1240,
+        60
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-05: the mailbox check said this one must not go.\n--\n-- $1 outreach id, $2 verdict ('hold' | 'drop'), $3 reason, $4 Reoon status.\n-- 'hold' parks it for a human; 'drop' skips it and suppresses the address,\n-- the same as a bounce would have - without the bounce. Any other verdict\n-- (an 'error' - the check itself failed) changes nothing: the message stays\n-- approved and is checked again next run.\n-- status = 'approved' is repeated for the same reason mark-outreach-sent.sql\n-- repeats it.\n\nWITH changed AS (\n  UPDATE outreach SET\n    status        = CASE WHEN $2::text = 'drop' THEN 'skipped' ELSE 'needs_review' END,\n    review_reason = $3::text,\n    guard_flags   = guard_flags || jsonb_build_object('mailbox_check', $4::text, 'mailbox_checked_at', now())\n  WHERE id = $1::bigint\n    AND status = 'approved'\n    AND $2::text IN ('hold', 'drop')\n  RETURNING id, to_email, status\n),\n\nsuppressed AS (\n  INSERT INTO suppression (kind, value, reason)\n  SELECT 'email', lower(to_email), 'mailbox check: ' || $4::text || ' on ' || to_char(now(), 'YYYY-MM-DD')\n  FROM changed\n  WHERE status = 'skipped'\n  ON CONFLICT (kind, lower(value)) DO NOTHING\n  RETURNING id\n)\n\nSELECT (SELECT count(*) FROM changed) AS changed, (SELECT count(*) FROM suppressed) AS suppressed;\n",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.verdict, $json.reason, $json.mailbox || ''] }}"
+        }
+      },
+      "id": "ch05-hold-unverified",
+      "name": "Hold or drop it",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1020,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e2",
+              "leftValue": "={{ $json.alert }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch05-alert-gate",
+      "name": "Worth an alarm?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        340,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "=CH-05 did not send: {{ $json.reason }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch05-alarm-telegram",
+      "name": "Say why we stopped",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        580,
+        420
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-05 \u2014 Send approved outreach\n\n**Sends on its own, every 5 minutes - one message per run.** It sends the oldest row with `status = 'approved'`: CH-04 approves a draft automatically only when it passed every guard; anything held stays `needs_review` and is never sent unless a human approves it.\n\n### The brake, every run\n\n1. Bounce circuit breaker \u2014 8 bounces in 7 days (or 8% of sends) stops everything.\n2. Daily cap \u2014 100/day (owner's instruction).\n3. Every precondition re-checked at send time: suppression, closure, natural-person flag.\n4. Minimum gap since the last send.\n5. Not at the weekend, and inside business hours, in the **recipient's** country.\n6. **Is the mailbox real?** \u2014 Reoon checks the address before the first message. Only a confirmed mailbox is sent; a dead one is skipped and suppressed, an unconfirmable one held for review, and a failed check sends nothing.\n\nEvery send is BCC'd to our own mailbox and reported on Telegram. CH-06 marks replies and bounces and stops the follow-up.\n\nTo stop all sending: unpublish this workflow, or set CH-04's `auto_approve` to false.",
+        "height": 620,
+        "width": 620,
+        "color": 3
+      },
+      "id": "ch05-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1480,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "How is the sender doing?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "How is the sender doing?": {
+      "main": [
+        [
+          {
+            "node": "Next approved message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Next approved message": {
+      "main": [
+        [
+          {
+            "node": "BRAKES: may we send this one?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BRAKES: may we send this one?": {
+      "main": [
+        [
+          {
+            "node": "Cleared to send?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Worth an alarm?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleared to send?": {
+      "main": [
+        [
+          {
+            "node": "Is the mailbox real?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send it": {
+      "main": [
+        [
+          {
+            "node": "Mark it sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Worth an alarm?": {
+      "main": [
+        [
+          {
+            "node": "Say why we stopped",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is the mailbox real?": {
+      "main": [
+        [
+          {
+            "node": "Real mailbox?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Real mailbox?": {
+      "main": [
+        [
+          {
+            "node": "Send it",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Hold or drop it",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Worth an alarm?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

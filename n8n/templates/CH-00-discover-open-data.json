@@ -1,0 +1,179 @@
+{
+  "name": "CH-00 Client Hunt - Discover from open data",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "ch00-trigger-schedule",
+      "name": "Every 6 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ch00-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f1",
+              "name": "per_target_per_run",
+              "value": 10,
+              "type": "number"
+            },
+            {
+              "id": "f2",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "q3",
+              "name": "stop_when_pending_above",
+              "value": 150,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch00-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "per_target_per_run x 4 runs a day x enabled targets = leads a day. The real limit is downstream: CH-02 verifies about 720 a day, and every lead costs one or two Serper searches from the free 2,500."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "insert-open-data-leads.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.per_target_per_run, $('Config').first().json.stop_when_pending_above] }}"
+        }
+      },
+      "id": "ch00-insert",
+      "name": "Take new leads from open data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "ch00-summary.js"
+        }
+      },
+      "id": "ch00-summary",
+      "name": "What did we add?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## CH-00 \u2014 Discover from open data\n\nFree discovery. Takes leads from the Overture places already loaded for each enabled target's city: in the niche's categories (`niche_categories`), with a phone, holding no website, not closed, and not already a business here.\n\nThey are stored `PENDING` with source `overture`, and CH-02 verifies them exactly like an Apify lead - search, domain probes, PageSpeed. Stage B is kept from matching a lead against its own Overture record, so the dataset never vouches for itself.\n\nOnly cities with reference data are used (Oslo and Dubai today). Load another with `tools/load_reference_data.py`.\n\nCosts nothing to run. The real limits are CH-02's pace and Serper's free search credits.",
+        "height": 440,
+        "width": 560,
+        "color": 4
+      },
+      "id": "ch00-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1420,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Every 6 hours": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Take new leads from open data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Take new leads from open data": {
+      "main": [
+        [
+          {
+            "node": "What did we add?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

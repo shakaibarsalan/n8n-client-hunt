@@ -1,0 +1,183 @@
+{
+  "name": "CH-03 Client Hunt - Score leads",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 10 }] }
+      },
+      "id": "ch03s-trigger-cron",
+      "name": "Every 10 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-780, 200]
+    },
+    {
+      "parameters": {},
+      "id": "ch03s-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-780, 380]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "s1", "name": "batch_size", "value": 100, "type": "number" },
+            { "id": "s2", "name": "scoring_version", "value": "v1-2026-09", "type": "string" },
+            { "id": "s3", "name": "default_min_lead_score", "value": 60, "type": "number" },
+            { "id": "s4", "name": "telegram_chat_id", "value": "__ENV:TELEGRAM_CHAT_ID__", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch03s-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-560, 290],
+      "notes": "scoring_version MUST match the SCORING_VERSION constant at the top of score-lead.js exactly - tests/score-lead-version.test.js pins the two together so a mismatch fails CI rather than silently re-scoring nothing, forever, because every business already has a row under a version this Config no longer names."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT kind, key, weight FROM scoring_weights;",
+        "options": {}
+      },
+      "id": "ch03s-weights",
+      "name": "Load scoring weights",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-340, 290],
+      "credentials": { "postgres": { "name": "Client Hunt DB" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": { "$sql": "select-pending-scoring.sql" },
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.scoring_version, $('Config').first().json.batch_size] }}"
+        }
+      },
+      "id": "ch03s-pending",
+      "name": "Pick what needs scoring",
+      "type": "n8n-nodes-base.postgres",
+      "executeOnce": true,
+      "typeVersion": 2.5,
+      "position": [-120, 290],
+      "alwaysOutputData": true,
+      "notes": "Not yet scored under the CURRENT scoring_version - bumping the version after a calibration re-scores everything under the new model, and lead_scores keeps both versions rather than overwriting.",
+      "credentials": { "postgres": { "name": "Client Hunt DB" } }
+    },
+    {
+      "parameters": {
+        "jsCode": { "$snippet": "score-lead.js" }
+      },
+      "id": "ch03s-score",
+      "name": "Score the lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [100, 290]
+    },
+    {
+      "parameters": {
+        "jsCode": { "$snippet": "drop-empty-batch-sentinel.js" }
+      },
+      "id": "ch03s-drop-sentinel",
+      "name": "Drop the empty-batch sentinel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 290]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": { "$sql": "upsert-lead-score.sql" },
+        "options": {
+          "queryReplacement": "={{ [$json.business_id, $json.scoring_version, $json.total, $json.qualified, $json.needs_review, $json.review_reason || '', JSON.stringify($json.components)] }}"
+        }
+      },
+      "id": "ch03s-store",
+      "name": "Store the score",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [540, 290],
+      "credentials": { "postgres": { "name": "Client Hunt DB" } }
+    },
+    {
+      "parameters": {
+        "jsCode": { "$snippet": "ch03-score-summary.js" }
+      },
+      "id": "ch03s-summary",
+      "name": "What did scoring produce?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [760, 290]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "version": 2 },
+          "conditions": [
+            {
+              "id": "sw1",
+              "leftValue": "={{ $json.quiet }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "false", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch03s-worth-saying",
+      "name": "Is this worth a message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [980, 290]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": { "appendAttribution": false }
+      },
+      "id": "ch03s-telegram",
+      "name": "Tell me",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1200, 290],
+      "credentials": { "telegramApi": { "name": "Client Hunt Telegram" } }
+    },
+    {
+      "parameters": {
+        "content": "## CH-03 — Score leads\n\nTurns a CH-02 verdict into a number. Deterministic, no external calls, so this is free and safe to run often.\n\n```\nLead Score (0-100) = Website Opportunity (0-40)\n                    + Business Viability  (0-25)\n                    + Contactability      (0-20)\n                    + Spend Potential     (0-15)\n```\n\nThe full reasoning for each component is in `n8n/snippets/score-lead.js` — it is a starting hypothesis, not a finding, and says so in its own comments.\n\n### Two fields that do not live on `businesses`\n\n`probe_was_unreachable` and `psi_performance` only ever existed as in-memory values partway through CH-02's pipeline. `select-pending-scoring.sql` derives both from `website_checks` — the append-only evidence trail — rather than giving them their own columns purely to carry transient state.\n\n### Versioning\n\n`scoring_version` in `Config` must match the `SCORING_VERSION` constant in `score-lead.js` exactly. A mismatch does not error — it just means nothing gets scored, silently, forever, because every business already has a row under the version nobody is asking for any more. `tests/score-lead-version.test.js` pins the two together so CI catches this instead.\n\nAfter roughly 50 outreach attempts, refit the weights in `scoring_weights` against actual reply rate and bump both the constant and this Config value together — `lead_scores` is unique on `(business_id, scoring_version)` precisely so the old and new scores can coexist and be compared.\n\n### What happens to a qualified lead\n\nNothing, from here. CH-04 reads `lead_scores.qualified = true` and drafts an outreach message — this workflow only ever writes the score.",
+        "height": 760,
+        "width": 620,
+        "color": 7
+      },
+      "id": "ch03s-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1480, 100]
+    }
+  ],
+  "connections": {
+    "Every 10 minutes": { "main": [[{ "node": "Config", "type": "main", "index": 0 }]] },
+    "Run manually": { "main": [[{ "node": "Config", "type": "main", "index": 0 }]] },
+    "Config": { "main": [[{ "node": "Load scoring weights", "type": "main", "index": 0 }]] },
+    "Load scoring weights": { "main": [[{ "node": "Pick what needs scoring", "type": "main", "index": 0 }]] },
+    "Pick what needs scoring": { "main": [[{ "node": "Score the lead", "type": "main", "index": 0 }]] },
+    "Score the lead": { "main": [[{ "node": "Drop the empty-batch sentinel", "type": "main", "index": 0 }]] },
+    "Drop the empty-batch sentinel": { "main": [[{ "node": "Store the score", "type": "main", "index": 0 }]] },
+    "Store the score": { "main": [[{ "node": "What did scoring produce?", "type": "main", "index": 0 }]] },
+    "What did scoring produce?": { "main": [[{ "node": "Is this worth a message?", "type": "main", "index": 0 }]] },
+    "Is this worth a message?": { "main": [[{ "node": "Tell me", "type": "main", "index": 0 }], []] }
+  }
+}

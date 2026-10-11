@@ -1,0 +1,571 @@
+{
+  "name": "CH-02 Client Hunt - Verify the website gap",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "ch02-trigger-cron",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ch02-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b1",
+              "name": "batch_size",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "b2",
+              "name": "probe_timeout_ms",
+              "value": 5000,
+              "type": "number"
+            },
+            {
+              "id": "b3",
+              "name": "max_probes_per_business",
+              "value": 6,
+              "type": "number"
+            },
+            {
+              "id": "b4",
+              "name": "search_timeout_ms",
+              "value": 10000,
+              "type": "number"
+            },
+            {
+              "id": "b5",
+              "name": "psi_timeout_ms",
+              "value": 45000,
+              "type": "number"
+            },
+            {
+              "id": "b6",
+              "name": "serper_api_key",
+              "value": "__ENV:SERPER_API_KEY__",
+              "type": "string"
+            },
+            {
+              "id": "b7",
+              "name": "pagespeed_api_key",
+              "value": "__ENV:PAGESPEED_API_KEY__",
+              "type": "string"
+            },
+            {
+              "id": "b8",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "b9",
+              "name": "user_agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              "type": "string"
+            },
+            {
+              "id": "q10",
+              "name": "verify_while_queue_below",
+              "value": 90,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch02-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "serper_api_key empty = Stage C is skipped and the classifier gives it no credit, so confidence stays low rather than pretending a search happened. That is the intended degraded mode, not a broken one. Values written as __ENV:<VARNAME>__ are replaced at import time from the environment, so a secret never enters this file or git. A placeholder left unreplaced means the variable was not set, and the node that uses it degrades rather than sending a literal \"__ENV:...__\" anywhere."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT domain, kind, counts_as_social, active FROM platform_domains WHERE active;",
+        "options": {}
+      },
+      "id": "ch02-platforms",
+      "name": "Load platform domains",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-02: what still needs verifying?\n--\n-- The work queue is DERIVED FROM THE DATA rather than held in a queue table.\n-- An interrupted run therefore resumes correctly, a business is never\n-- verified twice, and there is no queue to drift out of sync with reality.\n--\n-- The cctlds come from the search target, so a Norwegian salon gets .no\n-- probed before .com and a Spanish one gets .es. Without this join the domain\n-- prover would burn its probe budget on the wrong guesses in every country\n-- except the United States.\n\nSELECT\n  b.id,\n  b.google_place_id,\n  b.niche,\n  b.name,\n  b.name_norm,\n  b.city,\n  b.country,\n  b.phone_e164,\n  b.email,\n  b.geohash7,\n  b.lat,\n  b.lon,\n  b.rating,\n  b.review_count,\n  b.address,\n  b.social_profiles,\n  b.permanently_closed,\n  b.raw ->> 'website'            AS source_website_raw,\n  -- A search recorded by hand (stage-c-search.js uses it instead of Serper).\n  b.raw -> 'hand_search'         AS hand_search,\n  COALESCE(t.cctlds, ARRAY['.com'])  AS cctlds,\n  COALESCE(t.min_lead_score, 60)     AS min_lead_score,\n  t.niche_query\nFROM businesses b\nLEFT JOIN search_targets t ON t.id = b.search_target_id\nWHERE b.website_status = 'PENDING'\n  AND b.permanently_closed = false\n  -- Verify on demand. Every lead costs a Serper search, and CH-02 used to\n  -- verify ~1,400 a day for a sender that sends 30: the 2,500 free credits\n  -- on a fresh key were gone in twelve hours (5-6 Oct 2026) while 943\n  -- verified leads and 183 approved messages sat unused. Now nothing is\n  -- verified while the approved queue holds $2 or more messages.\n  AND ((SELECT count(*) FROM outreach WHERE status = 'approved') < $2::int\n       -- Searched by hand on purpose: verify now, whatever the queue.\n       OR b.raw ? 'hand_search')\nORDER BY\n  -- Hand-searched first, and a batch of them never calls Serper at all, so\n  -- they get through even while the key is refused.\n  (b.raw ? 'hand_search') DESC,\n  -- A lead with an email can be written to; one without only reaches the\n  -- WhatsApp list, which has hundreds verified already.\n  (coalesce(b.email, '') <> '') DESC,\n  -- Businesses with more reviews are more likely to be worth the verification\n  -- spend, so they go first when the batch limit bites.\n  b.review_count DESC NULLS LAST,\n  b.first_seen_at ASC\nLIMIT $1::int;\n",
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.batch_size, $('Config').first().json.verify_while_queue_below] }}"
+        }
+      },
+      "id": "ch02-pending",
+      "name": "Pick what needs checking",
+      "type": "n8n-nodes-base.postgres",
+      "executeOnce": true,
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        290
+      ],
+      "alwaysOutputData": true,
+      "notes": "The work queue is derived from the data (website_status = 'PENDING'), not held in a queue table. An interrupted run resumes correctly and no business is ever verified twice.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-02, node: \"Stage A: what did the source actually claim?\"\n// Mode: Run Once for All Items\n//\n// Cheapest stage, so it runs first. It decides what the Maps listing's\n// website field MEANS, which is not the same as whether it is empty.\n//\n// Three outcomes:\n//   'absent'   - no website field at all\n//   'platform' - a field pointing at Facebook, Instagram, Linktree, a\n//                directory, a booking platform, or a dead business.site.\n//                Commercially this is the same prospect as 'absent', and\n//                sometimes a better one.\n//   'real'     - something that might genuinely be their own site\n//\n// The platform list comes from the platform_domains TABLE, not from a\n// constant here, because it changes. business.site was a real website in 2023\n// and a dead link by June 2024, and that change should be one UPDATE rather\n// than an edit-and-reimport of this workflow.\n\nconst platforms = $('Load platform domains').all().map((i) => i.json);\n\nconst byDomain = new Map();\nfor (const p of platforms) {\n  if (p.active === false) continue;\n  byDomain.set(String(p.domain).toLowerCase(), p);\n}\n\n// See the same guard in merge-stage-b.js. An empty list here means a Facebook\n// page or a dead business.site in the Maps website field is read as a real\n// website, which throws away exactly the prospects this project exists to\n// find. Silence is the dangerous outcome, so this refuses instead.\nif (byDomain.size === 0) {\n  throw new Error(\n    'Stage A has an EMPTY platform list. \"Load platform domains\" returned no usable ' +\n    'rows, so a social or directory URL in the Maps website field would be read as a ' +\n    'real website and the lead discarded. Refusing to classify rather than classify ' +\n    'wrongly.');\n}\n\n// Matches the host itself and any subdomain of it, so that\n// \"mysalon.wixsite.com\" is caught by the \"wixsite.com\" row.\nconst classifyHost = (host) => {\n  const h = String(host || '').toLowerCase().replace(/^www\\./, '');\n  if (!h) return null;\n  if (byDomain.has(h)) return byDomain.get(h);\n  const parts = h.split('.');\n  for (let i = 1; i < parts.length - 1; i++) {\n    const suffix = parts.slice(i).join('.');\n    if (byDomain.has(suffix)) return byDomain.get(suffix);\n  }\n  return null;\n};\n\n// Host extraction that does not depend on the sandbox providing URL. PROVEN\n// necessary, not defensive: the n8n Code node sandbox does not expose a\n// working URL constructor, confirmed in production by the host_parsed_by\n// evidence field in merge-stage-b.js, which reported \"regex\" on a live run.\n// Every `new URL()` in this project was therefore always throwing, and each\n// site's catch block quietly did the wrong thing - here, returning '' makes a\n// listing that HAS a website read as 'absent'.\nconst hostOf = (url) => {\n  const s = String(url || '').trim();\n  if (!s) return '';\n  try {\n    if (typeof URL === 'function') {\n      const h = new URL(/^https?:\\/\\//i.test(s) ? s : 'https://' + s).hostname;\n      if (h) return h;\n    }\n  } catch (e) { /* fall through to the regex, which needs no globals */ }\n  return s.replace(/^[a-z][a-z0-9+.-]*:\\/\\//i, '')\n          .split(/[/?#]/)[0]\n          .split('@').pop()\n          .split(':')[0];\n};\n\n// \"Pick what needs checking\" has alwaysOutputData set, so that this stage\n// still runs (and CH-02 does not silently do nothing with no trace) even\n// when there is nothing pending. But that means a zero-row query arrives\n// here as ONE blank item ({}), not zero items - $input.all() is never\n// actually empty. Without this filter, that blank item would be processed\n// as if it were a real business (an empty name, an empty city, id:\n// undefined) and pushed all the way through Stages B-F for real, wasting\n// real HTTP and Serper calls on nothing, before eventually crashing far\n// downstream on a NOT NULL violation when the verdict tries to write with\n// business_id undefined - found running for real, id-less rows reaching\n// \"Write the verdict and the evidence\" whenever the pending backlog was\n// genuinely empty.\nconst out = [];\n\nfor (const item of $input.all().filter((i) => i.json && i.json.id != null)) {\n  const b = item.json;\n  const raw = String(b.source_website_raw || '').trim();\n\n  let claim = 'absent';\n  let socialOnly = false;\n  let url = '';\n  const socials = { ...(b.social_profiles || {}) };\n\n  if (raw) {\n    const host = hostOf(raw);\n    const hit = classifyHost(host);\n    if (hit) {\n      claim = 'platform';\n      // A social profile in the website field is a marketing channel they are\n      // actively using, and that is a buying signal - they already care about\n      // being findable and have nowhere of their own to send people.\n      if (hit.counts_as_social) {\n        socialOnly = true;\n        socials[hit.kind === 'shortener' ? 'linkinbio' : hit.domain.split('.')[0]] = raw;\n      }\n    } else if (host) {\n      claim = 'real';\n      url = raw;\n    }\n  }\n\n  // Social presence from the listing itself counts too, even when the website\n  // field was simply empty.\n  if (claim !== 'real' && Object.keys(socials).length) socialOnly = true;\n\n  out.push({\n    json: {\n      ...b,\n      social_profiles: socials,\n      stage_a_claim: claim,\n      stage_a_url: url,\n      stage_a_social_only: socialOnly,\n      website_checks: [{\n        stage: 'source',\n        method: 'maps.website_field',\n        candidate_url: raw || null,\n        outcome: claim === 'real' ? 'found' : (raw ? 'rejected' : 'not_found'),\n        evidence: { claim, raw_value: raw, social_only: socialOnly },\n      }],\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "ch02-stage-a",
+      "name": "Stage A: what did the source actually claim?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-02 Stage B: cross-check a candidate against the free open datasets.\n--\n-- This is the highest-leverage query in the project and it costs nothing to\n-- run. Google Maps says this business has no website; Overture and Foursquare\n-- are independent of Google and may well hold one. If they do, Stage A was\n-- wrong and we have caught a false positive for zero marginal cost.\n--\n-- Three match strategies, in descending order of confidence. The strongest\n-- one that hits wins.\n--\n--   1. phone in E.164     - two listings sharing a phone number are the same\n--                           business, whatever they call themselves\n--   2. name + geohash7    - same normalised name inside the same ~150m cell\n--   3. name + load_city   - weakest. Used only to establish PRESENCE in the\n--                           dataset, never on its own to assert a website,\n--                           because two salons with the same name in one city\n--                           is entirely plausible.\n--\n--  Strategy 3 compares against load_city - the city WE searched for - not the\n--  dataset's own locality field. Overture stores the locality as the upstream\n--  provider wrote it, which for Dubai is Arabic. Comparing Google's \"Dubai\"\n--  against that can never match, so this fallback silently ceased to exist for\n--  the whole Gulf until it was noticed in the loaded data.\n--\n-- match_rank is returned so the caller can tell how much to trust the answer\n-- rather than treating all three as equivalent.\n\nWITH candidate AS (\n  SELECT\n    $1::text AS place_id,\n    $2::text AS name_norm,\n    $3::text AS phone_e164,\n    $4::text AS geohash7,\n    $5::text AS city\n),\n\noverture AS (\n  SELECT\n    'overture'::text AS src,\n    o.gers_id        AS ref_id,\n    o.websites,\n    o.socials,\n    o.confidence,\n    o.operating_status,\n    CASE\n      WHEN c.phone_e164 <> '' AND o.phone_e164 = c.phone_e164        THEN 1\n      WHEN c.geohash7   <> '' AND o.geohash7   = c.geohash7\n                              AND o.name_norm  = c.name_norm          THEN 2\n      WHEN lower(o.load_city) = lower(c.city) AND o.name_norm = c.name_norm THEN 3\n    END AS match_rank\n  FROM ref_overture_places o\n  CROSS JOIN candidate c\n  -- A business CH-00 found IN Overture would otherwise match its own record\n  -- and earn \"an open dataset holds no website for them\" - the dataset\n  -- vouching for itself. Its own row is excluded; any OTHER record still counts.\n  WHERE ('ovt:' || o.gers_id) <> c.place_id\n    AND ((c.phone_e164 <> '' AND o.phone_e164 = c.phone_e164)\n     OR (c.geohash7   <> '' AND o.geohash7   = c.geohash7 AND o.name_norm = c.name_norm)\n     OR (lower(o.load_city) = lower(c.city) AND o.name_norm = c.name_norm))\n),\n\nfsq AS (\n  SELECT\n    'fsq'::text       AS src,\n    f.fsq_place_id    AS ref_id,\n    CASE WHEN COALESCE(f.website, '') <> '' THEN ARRAY[f.website] ELSE '{}'::text[] END AS websites,\n    ARRAY_REMOVE(ARRAY[f.facebook_id, f.instagram, f.twitter], NULL) AS socials,\n    NULL::numeric     AS confidence,\n    CASE WHEN f.date_closed IS NOT NULL THEN 'closed' ELSE NULL END AS operating_status,\n    CASE\n      WHEN c.phone_e164 <> '' AND f.tel_e164 = c.phone_e164          THEN 1\n      WHEN c.geohash7   <> '' AND f.geohash7 = c.geohash7\n                              AND f.name_norm = c.name_norm           THEN 2\n      WHEN lower(f.load_city) = lower(c.city) AND f.name_norm = c.name_norm THEN 3\n    END AS match_rank\n  FROM ref_fsq_places f\n  CROSS JOIN candidate c\n  WHERE (c.phone_e164 <> '' AND f.tel_e164 = c.phone_e164)\n     OR (c.geohash7   <> '' AND f.geohash7 = c.geohash7 AND f.name_norm = c.name_norm)\n     OR (lower(f.load_city) = lower(c.city) AND f.name_norm = c.name_norm)\n),\n\nmatches AS (\n  SELECT * FROM overture\n  UNION ALL\n  SELECT * FROM fsq\n)\n\nSELECT\n  (SELECT place_id FROM candidate)                       AS place_id,\n  COUNT(*) > 0                                           AS matched,\n  MIN(match_rank)                                        AS best_match_rank,\n  -- A website only counts when the match that produced it was rank 1 or 2.\n  -- A name-and-city match is not strong enough to attach somebody else's\n  -- website to this business, and doing so would turn a real prospect into a\n  -- discarded HAS_WEBSITE.\n  COALESCE(\n    (SELECT w\n     FROM matches m, unnest(m.websites) AS w\n     WHERE m.match_rank <= 2 AND COALESCE(w, '') <> ''\n     LIMIT 1),\n    ''\n  )                                                      AS website,\n  COALESCE(\n    (SELECT array_agg(DISTINCT s)\n     FROM matches m, unnest(m.socials) AS s\n     WHERE COALESCE(s, '') <> ''),\n    '{}'::text[]\n  )                                                      AS socials,\n  BOOL_OR(operating_status = 'closed')                   AS looks_closed,\n  MIN(confidence)                                        AS min_confidence,\n  COALESCE(array_agg(DISTINCT src), '{}'::text[])        AS sources\nFROM matches;\n",
+        "options": {
+          "queryReplacement": "={{ [$json.google_place_id, $json.name_norm, $json.phone_e164 || '', $json.geohash7 || '', $json.city || ''] }}"
+        }
+      },
+      "id": "ch02-stage-b",
+      "name": "Stage B: cross-check the open datasets",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        320,
+        290
+      ],
+      "alwaysOutputData": true,
+      "notes": "Free and unlimited. This is the stage that catches the false positives Google Maps produces, and it is the one a naive design leaves out entirely.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-02, node: \"Stage B: what do the free datasets say?\"\n// Mode: Run Once for All Items\n//\n// Re-attaches the cross-check answers to the businesses they belong to.\n//\n// Pairing is BY PLACE ID, not by position. The Postgres node returns one row\n// per input item in order, so zipping by index looks like it works - and then\n// one day a query returns no row for one input, every subsequent answer is\n// attached to the wrong business, and a salon inherits a neighbouring shop's\n// website. Nothing about that failure looks like a bug; it looks like bad\n// data. The cross-check query returns place_id for exactly this reason.\n\nconst answers = new Map();\nfor (const item of $input.all()) {\n  const a = item.json;\n  if (a && a.place_id) answers.set(String(a.place_id), a);\n}\n\n// --- the open datasets need the same scepticism as the Maps listing --------\n//\n// Stage A already discounts a \"website\" that is really a Facebook page. Stage B\n// did not, and an open dataset is no more discriminating than Google about what\n// counts as a website.\n//\n// Caught on the first 30 real businesses: Overture holds\n//   http://www.flickr.com/photos/<the-salon's-album>/\n// as the website for an Oslo salon. Taken at face value that business becomes\n// HAS_WEBSITE and is dropped - when a one-person beauty business whose entire\n// web presence is a Flickr album is close to the ideal prospect for this\n// project.\n//\n// So the platform list is applied to BOTH sources. A dataset URL on a platform\n// host is treated exactly as Stage A treats it: not a website, and a social\n// signal if it is somewhere they actually publish.\nconst platforms = new Map();\nfor (const p of $('Load platform domains').all().map((i) => i.json)) {\n  if (p.active !== false) platforms.set(String(p.domain).toLowerCase(), p);\n}\n\n// An empty platform list is not a harmless edge case, it is the quiet version\n// of the worst bug this stage can have: every booking page, dead\n// business.site and Linktree the open datasets hold gets accepted as a real\n// website, and the business - a perfect prospect, since a booking page is not\n// a website - is discarded as HAS_WEBSITE and never contacted again.\n//\n// Found for real: one Dubai salon was classified HAS_WEBSITE at 0.85 against\n// a fresha.com booking URL, and another against a <name>.business.site URL -\n// both hosts ARE in platform_domains and\n// both were accepted anyway. The code below is correct when handed the real\n// 163 rows (verified directly), so the list was not reaching it at runtime.\n// Failing loudly here turns a silent lead-losing bug into a visible one.\nif (platforms.size === 0) {\n  throw new Error(\n    'Stage B has an EMPTY platform list. \"Load platform domains\" returned no usable ' +\n    'rows, so every dataset URL would be believed - including booking pages and dead ' +\n    'website builders, which would discard real prospects as HAS_WEBSITE. Refusing to ' +\n    'classify rather than classify wrongly.');\n}\n\n// How the host was extracted, recorded in the evidence below. See hostOf.\nlet lastParsedBy = 'none';\n\n// Host extraction that does NOT depend on the sandbox providing a global URL\n// constructor. The previous version called `new URL(...)` inside a try/catch\n// whose catch returned null - and null here means \"not a platform\", so ANY\n// parse failure silently became \"this is a real website\" and the lead was\n// discarded as HAS_WEBSITE. That is the most expensive direction to fail in,\n// and it is invisible: the same code returns the right answer in plain Node,\n// which is why every local test of it passed while production kept accepting\n// fresha.com and business.site URLs.\n//\n// The regex path needs no globals at all, so it works regardless of what the\n// Code node sandbox exposes.\nconst hostOf = (url) => {\n  const s = String(url || '').trim();\n  if (!s) { lastParsedBy = 'empty'; return ''; }\n  try {\n    if (typeof URL === 'function') {\n      const h = new URL(/^https?:\\/\\//i.test(s) ? s : 'https://' + s)\n        .hostname.toLowerCase().replace(/^www\\./, '');\n      if (h) { lastParsedBy = 'URL'; return h; }\n    }\n  } catch (e) { /* fall through - the regex below needs no globals */ }\n  lastParsedBy = 'regex';\n  return s.replace(/^[a-z][a-z0-9+.-]*:\\/\\//i, '')\n          .split(/[/?#]/)[0]\n          .split('@').pop()\n          .split(':')[0]\n          .toLowerCase()\n          .replace(/^www\\./, '');\n};\n\nconst platformHit = (url) => {\n  const host = hostOf(url);\n  if (!host) return null;\n  if (platforms.has(host)) return platforms.get(host);\n  const parts = host.split('.');\n  for (let i = 1; i < parts.length - 1; i++) {\n    const suffix = parts.slice(i).join('.');\n    if (platforms.has(suffix)) return platforms.get(suffix);\n  }\n  return null;\n};\n\nconst out = [];\n\nfor (const item of $('Stage A: what did the source actually claim?').all()) {\n  const b = item.json;\n  const a = answers.get(String(b.google_place_id));\n\n  const checks = [...(b.website_checks || [])];\n\n  if (!a) {\n    // No row came back at all. That is not \"no website\" - it is \"the check\n    // did not run\", and the two must not collapse into each other.\n    checks.push({\n      stage: 'dataset', method: 'crosscheck', candidate_url: null,\n      outcome: 'skipped', evidence: { why: 'no cross-check row returned for this place id' },\n    });\n    out.push({ json: { ...b, stage_b_checked: false, stage_b_matched: false,\n                       stage_b_website: '', website_checks: checks } });\n    continue;\n  }\n\n  const matched = Boolean(a.matched);\n  const rank = a.best_match_rank == null ? null : Number(a.best_match_rank);\n\n  // Filter the dataset's answer through the platform list before believing it.\n  const rawWebsite = String(a.website || '');\n  const hit = rawWebsite ? platformHit(rawWebsite) : null;\n  const website = hit ? '' : rawWebsite;\n  const datasetPlatformUrl = hit ? rawWebsite : '';\n\n  checks.push({\n    stage: 'dataset',\n    method: 'crosscheck.' + (rank === 1 ? 'phone' : rank === 2 ? 'name+geo' : rank === 3 ? 'name+city' : 'none'),\n    candidate_url: rawWebsite || null,\n    outcome: website ? 'found' : hit ? 'rejected' : matched ? 'not_found' : 'skipped',\n    evidence: {\n      matched,\n      match_rank: rank,\n      sources: a.sources || [],\n      socials_found: (a.socials || []).length,\n      dataset_confidence: a.min_confidence,\n      // Recorded so a wrong verdict can be traced to the list that produced\n      // it, rather than re-argued from the code months later.\n      platform_list_size: platforms.size,\n      host_parsed_by: lastParsedBy,\n      // Recorded rather than discarded, so the audit trail shows the dataset\n      // DID hold a URL and why it was not accepted as a website.\n      ...(hit ? { rejected_as: hit.kind, rejected_url: rawWebsite } : {}),\n    },\n  });\n\n  // Open-data socials are worth keeping even when no website turns up: they\n  // feed the lead score and they are often the only contact route for a\n  // business that has nothing else.\n  const socials = { ...(b.social_profiles || {}) };\n  // A platform URL the dataset called a \"website\" is a social signal, not a\n  // website - and a strong one: they publish somewhere, they just have nowhere\n  // of their own to send people.\n  if (datasetPlatformUrl && hit && hit.counts_as_social) {\n    const key = String(hit.domain).split('.')[0];\n    if (!socials[key]) socials[key] = datasetPlatformUrl;\n  }\n  for (const s of a.socials || []) {\n    if (!s) continue;\n    const key = /facebook/i.test(s) ? 'facebook'\n      : /instagram/i.test(s) ? 'instagram'\n      : /twitter|x\\.com/i.test(s) ? 'twitter'\n      : /linkedin/i.test(s) ? 'linkedin' : 'other';\n    if (!socials[key]) socials[key] = s;\n  }\n\n  out.push({\n    json: {\n      ...b,\n      social_profiles: socials,\n      stage_a_social_only: b.stage_a_social_only || Object.keys(socials).length > 0,\n      stage_b_checked: true,\n      stage_b_matched: matched,\n      stage_b_match_rank: rank,\n      stage_b_website: website,\n      // An open dataset saying the place has closed is worth acting on even\n      // when Google still lists it as open - Google is slow to retire a\n      // listing nobody has corrected.\n      stage_b_looks_closed: Boolean(a.looks_closed),\n      website_checks: checks,\n    },\n  });\n}\n\nif (!out.length) {\n  throw new Error(\n    'Stage B produced no items. Stage A returned ' +\n    $('Stage A: what did the source actually claim?').all().length +\n    ' businesses and the cross-check returned ' + answers.size + ' answers. ' +\n    'If the second number is 0, the reference tables are probably empty - ' +\n    'run tools/load_overture.py and tools/load_fsq.py.'\n  );\n}\n\nreturn out;\n"
+      },
+      "id": "ch02-merge-b",
+      "name": "Stage B: what do the free datasets say?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// CH-02, node: \"Stage C: search for them\"\n// Mode: Run Once for Each Item\n//\n// Asks a search engine whether this business has a site anywhere, and keeps\n// the best candidate domain for Stage D to prove.\n//\n// A search HIT IS NOT A VERDICT. A result proves only that some page mentions\n// the name. The domain it points at still has to survive Stage D, which\n// fetches it and checks the page actually names this business. Accepting a\n// search result directly is how you decide a salon owns a competitor's site\n// because a directory page listed them both.\n//\n// The fetch happens inside this Code node rather than in an HTTP node, for\n// the reason the job-hunt repo documented: a two-HTTP-node shape produced an\n// item-pairing bug where one business's response was read for all of them.\n// Here the request and its response never leave the item that owns them.\n\nconst b = $json;\nconst CFG = $('Config').first().json;\n\n// Skip conditions. Stage C is the first stage that costs money, so anything\n// already settled must not reach the API.\nif (b.stage_a_claim === 'real' || b.stage_b_website) {\n  return { json: { ...b, stage_c_ran: false, stage_c_candidate: '',\n                   stage_c_skipped: 'already resolved by an earlier stage' } };\n}\n\nconst platforms = $('Load platform domains').all().map((i) => String(i.json.domain).toLowerCase());\nconst isPlatform = (host) => {\n  const h = host.replace(/^www\\./, '');\n  return platforms.some((p) => h === p || h.endsWith('.' + p));\n};\n\n// A search done by hand. When the Serper credits are gone, Claude can search\n// for a batch of leads in a working session and record what it found in\n// businesses.raw.hand_search ({candidate, results, why, by, searched_at});\n// select-pending.sql brings those leads up first. It stands in for exactly\n// this stage - Stage D still has to PROVE any candidate - so a hand search\n// earns the same credit as an API search, no more.\nconst hand = b.hand_search && typeof b.hand_search === 'object' ? b.hand_search : null;\nif (hand) {\n  const handHost = String(hand.candidate || '').toLowerCase().replace(/^www\\./, '').trim();\n  const usable = handHost && !isPlatform(handHost) ? handHost : '';\n  return { json: { ...b, stage_c_ran: true, stage_c_candidate: usable, search_candidate_domain: usable,\n    website_checks: [...(b.website_checks || []), {\n      stage: 'search', method: String(hand.by || 'by hand').slice(0, 40),\n      candidate_url: usable || null, outcome: usable ? 'found' : 'not_found',\n      evidence: { query: String(hand.query || `\"${b.name}\" ${b.city || ''}`).slice(0, 200),\n                  results: Number(hand.results) || 0, why: String(hand.why || '').slice(0, 200),\n                  searched_at: hand.searched_at || null },\n    }] } };\n}\n\nconst key = CFG.serper_api_key || '';\nif (!key) {\n  // No key is a configuration state, not a finding. Saying so explicitly\n  // keeps the classifier from crediting a search that never happened.\n  return { json: { ...b, stage_c_ran: false, stage_c_candidate: '',\n                   stage_c_skipped: 'no search key configured' } };\n}\n\nconst city = b.city || '';\n// One query, not two. The second (name + city + niche) only ever ran when\n// the first found nothing - which for a business with no website is nearly\n// always - so it doubled the cost of exactly the leads this project wants,\n// and the free search credits ran out at half the leads.\nconst queries = [\n  `\"${b.name}\" ${city}`,\n];\n\nconst checks = [...(b.website_checks || [])];\nlet candidate = '';\nlet why = '';\nlet ran = false;\n\nfor (const q of queries) {\n  if (candidate) break;\n  let res;\n  try {\n    res = await this.helpers.httpRequest({\n      method: 'POST',\n      url: 'https://google.serper.dev/search',\n      headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },\n      body: { q, num: 10, gl: CFG.search_country || undefined },\n      json: true,\n      timeout: Number(CFG.search_timeout_ms || 15000),\n    });\n    ran = true;\n  } catch (e) {\n    const msg = String(e && e.message || e);\n    // Serper refusing the KEY (400/401/402/403 - in practice \"not enough\n    // credits\") is not one failed search, it is every search from now on.\n    // Carrying on verified leads half-blind: on 5 Oct 2026, 252 of 314\n    // leads checked after the credits ran out came out WEBSITE_UNCERTAIN and\n    // were never emailed. Failing the run instead leaves the batch PENDING,\n    // to be verified properly once the key works again. A 429 (rate limit)\n    // or a timeout is transient and is still just recorded below.\n    if (/status code 40[0-3]\\b/.test(msg)) {\n      throw new Error('Search (Serper) refused the key - probably out of credits: ' + msg +\n        '. Stopping this run so leads stay PENDING instead of being verified without a ' +\n        'search. Top up the Serper account or set a new SERPER_API_KEY, then re-import the workflows.');\n    }\n    // A failed search is NOT evidence of absence. ran stays false unless at\n    // least one query actually came back, and the classifier gives credit for\n    // Stage C only when ran is true.\n    checks.push({\n      stage: 'search', method: 'serper', candidate_url: null, outcome: 'unreachable',\n      evidence: { query: q, error: String(e && e.message || e).slice(0, 200) },\n    });\n    continue;\n  }\n\n  const organic = Array.isArray(res && res.organic) ? res.organic : [];\n  for (const r of organic) {\n    // The sandbox does not expose a working URL constructor (proven in\n    // production - see merge-stage-b.js). The old line here was\n    // `try { host = new URL(r.link).hostname } catch { continue; }`, so the\n    // catch fired on EVERY result and `continue` skipped all of them: Stage C\n    // has never contributed a single candidate domain, silently, while\n    // reporting itself as having run. The regex below needs no globals.\n    const raw = String(r.link || '').trim();\n    const host = raw\n      .replace(/^[a-z][a-z0-9+.-]*:\\/\\//i, '')\n      .split(/[/?#]/)[0]\n      .split('@').pop()\n      .split(':')[0]\n      .toLowerCase();\n    if (!host) continue;\n    if (isPlatform(host)) continue;              // a directory is not their site\n    if (/^(www\\.)?google\\./.test(host)) continue;\n\n    // The name has to appear in the result, and it has to be a DISTINCTIVE\n    // part of the name.\n    //\n    // The first version accepted any token of four characters or more,\n    // anywhere in the title or snippet. Against real results that meant\n    // \"<Name> Frisor\" matched 1881.no - the Norwegian phone book - on the word\n    // \"frisor\", and \"<Name> Beauty\" matched a global listings aggregator on\n    // \"beauty\". Every salon page on earth contains \"beauty\" and every\n    // hairdresser listing contains \"frisor\", so those words select nothing.\n    //\n    // The niche words are exactly the ones a DIRECTORY of this niche is full\n    // of, which is what makes them worse than useless here.\n    const GENERIC = new Set([\n      'salon', 'salong', 'salonger', 'beauty', 'hair', 'spa', 'nails', 'nail',\n      'barber', 'studio', 'lash', 'lashes', 'brows', 'skin', 'clinic', 'klinikk',\n      'peluqueria', 'estetica', 'parrucchiere', 'frisor', 'fris\u00f8r', 'kapper',\n      'real', 'estate', 'realty', 'properties', 'property', 'homes',\n      'inmobiliaria', 'immobiliare', 'eiendom', 'megler', 'realtor',\n      'oslo', 'dubai', 'norway', 'norge', 'centre', 'center', 'care',\n    ]);\n    const tokens = String(b.name_norm || '').split(/\\s+/)\n      .filter((w) => w.length >= 4 && !GENERIC.has(w));\n    if (!tokens.length) continue;    // nothing distinctive to match on\n\n    // Title or host only, not the snippet. A snippet is search-engine prose\n    // about the page and routinely quotes the query back, so matching it\n    // proves the search ran rather than that the page is theirs.\n    const hay = `${r.title || ''} ${host}`.toLowerCase();\n    if (!tokens.some((w) => hay.includes(w))) continue;\n\n    candidate = host;\n    why = `search result \"${String(r.title || '').slice(0, 60)}\" names them`;\n    break;\n  }\n\n  checks.push({\n    stage: 'search', method: 'serper', candidate_url: candidate || null,\n    outcome: candidate ? 'found' : 'not_found',\n    evidence: { query: q, results: organic.length, why: why || 'no non-platform result named them' },\n  });\n}\n\nreturn {\n  json: {\n    ...b,\n    stage_c_ran: ran,\n    stage_c_candidate: candidate,\n    // Stage D probes this first: a domain a search already surfaced is a far\n    // better guess than one assembled from the business name.\n    search_candidate_domain: candidate,\n    website_checks: checks,\n  },\n};\n"
+      },
+      "id": "ch02-stage-c",
+      "name": "Stage C: search for them",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// CH-02, node: \"Stage D: prove the domain\"\n// Mode: Run Once for Each Item\n//\n// NOTE ON COMMENTS IN THIS FILE: n8n validates a Code node body as raw text\n// and does not skip comments. Naming a disallowed accessor here - even to\n// explain a past bug - is rejected exactly like calling one. So the accessors\n// that are illegal in per-item mode are not written down anywhere below.\n//\n// ---------------------------------------------------------------------------\n// A business name is not a website. Turn it into candidate domains, fetch\n// each one, and keep it ONLY if the page proves it belongs to this business.\n//\n// Ported from job-hunt-automation/n8n/workflows/05-find-companies.json, node\n// \"Find and prove their website\", which earned each of these rules:\n//\n//   * a parked domain answers 200 and proves nothing\n//   * a placeholder page whose title is just the domain proves nothing\n//   * evidence must scale with the size of the guess. A domain built from the\n//     whole name is a small leap. A domain built from one word out of four is\n//     a large one: \"Anchor QX chemical industries\" became anchor.com, and\n//     anchor.com does say \"anchor\" somewhere.\n//   * when a name has no distinctive word, REFUSE. An earlier version treated\n//     \"nothing to check\" as \"check passed\" and matched \"Zed Example\n//     Solutions\" to zed.com, an unrelated agency.\n//\n// Added here, and the most important rule in this project:\n//\n//   * UNKNOWN IS NOT A PASS. A fetch that times out is `unreachable`, never\n//     \"no website\". The same repo shipped a bug where a timed-out probe was\n//     read as proof of absence. Here that mistake would send an email opening\n//     \"I noticed you don't have a website\" to somebody who does.\n\nconst biz = $json;\nconst CFG = $('Config').first().json;\n\nconst UA = CFG.user_agent ||\n  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +\n  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';\nconst TIMEOUT = Number(CFG.probe_timeout_ms || 9000);\nconst MAX_PROBES = Number(CFG.max_probes_per_business || 8);\n\nconst checks = [...(biz.website_checks || [])];   // carried forward from A/B/C\nconst record = (method, url, outcome, evidence) =>\n  checks.push({ stage: 'probe', method, candidate_url: url || null, outcome, evidence: evidence || {} });\n\n// The Maps listing naming its own site is the business speaking for itself.\n// Probing anyway would cost up to eight HTTP fetches per business to\n// re-answer a question that is closed.\nif (biz.stage_a_claim === 'real') {\n  return {\n    json: {\n      ...biz,\n      probe_result: 'skipped',\n      probe_looked: false,\n      probe_candidates_tried: 0,\n      probe_why: 'a website was already established before this stage',\n      website_checks: checks,\n    },\n  };\n}\n\n// A site an open dataset holds is NOT the same thing, and used to be treated\n// as if it were. Stage B pairs a business with a dataset place mostly by\n// phone number, and a phone number is shared far more often than it looks: a\n// salon chair rented inside a clinic, a booking line for a whole building, an\n// agent's mobile on two listings. The dataset place is then somebody else, and\n// so is its website.\n//\n// Found for real in the outreach queue, 7 of 9 drafts (names and domains\n// below are fictional stand-ins for the real rows):\n//   \"Beauty Care by KN\"          -> klinikk-a.test     (the clinic she works in)\n//   \"Fjordlys Frisor og ...\"     -> nabo-klinikk.test  (a neighbour)\n//   \"Xy eiendom\"                 -> megler-f.test\n// Each was believed, Stage F then found an email on that other business's\n// site, and the draft would have told the clinic its website \"could be\n// working harder\" - about somebody else's business.\n//\n// So the dataset's site is now the FIRST candidate this stage proves, under\n// exactly the rules every guessed domain has to pass.\nconst hostOf = (url) => String(url || '').trim()\n  .replace(/^[a-z][a-z0-9+.-]*:\\/\\//i, '')\n  .split(/[/?#]/)[0]\n  .split('@').pop()\n  .split(':')[0]\n  .toLowerCase()\n  .replace(/^www\\./, '');\nconst datasetUrl = String(biz.stage_b_website || '');\nconst datasetHost = datasetUrl ? hostOf(datasetUrl) : '';\n\n// --- 1. Build the evidence vocabulary --------------------------------------\n// Words distinctive enough to count as proof. \"the\" proves nothing, and\n// neither does \"salon\", \"beauty\" or \"estate\" - they are on half the web, and\n// certainly on every competitor's page in the same niche.\nconst GENERIC = new Set([\n  'salon', 'salong', 'beauty', 'hair', 'spa', 'nails', 'barber', 'studio',\n  'peluqueria', 'estetica', 'parrucchiere', 'frisor', 'kapper',\n  'real', 'estate', 'realty', 'properties', 'property', 'homes', 'immobilien',\n  'inmobiliaria', 'immobiliare', 'eiendom', 'megler', 'realtor',\n  'centre', 'center', 'clinic', 'shop', 'store', 'house', 'home',\n  'and', 'the', 'for', 'your', 'best', 'new', 'city',\n]);\n\nconst words = String(biz.name_norm || '').split(/\\s+/).filter(Boolean);\nconst core = words.filter((w) => !GENERIC.has(w));\nconst proof = words.filter((w) => w.length >= 4 && !GENERIC.has(w));\n\n// If nothing distinctive survives, this name cannot be proved either way.\n// Refusing here is not a gap in coverage; it is the check working. A salon\n// literally called \"Beauty Salon\" cannot be matched to beautysalon.no with\n// any confidence at all.\nif (!proof.length) {\n  record('name.no-distinctive-token', null, 'skipped',\n    { name_norm: biz.name_norm, why: 'no distinctive word to prove a domain with' });\n  // With a dataset site on file, keep believing it - the old behaviour - but\n  // say it was never proved. Throwing it away instead would turn a business\n  // that may well have a site into a \"no website\" pitch, which is the worse\n  // of the two mistakes. CH-04's address check is what stops an email going\n  // to that site's mailbox unproved.\n  if (datasetHost) {\n    return {\n      json: {\n        ...biz,\n        probe_result: 'skipped',\n        probe_looked: false,\n        probe_candidates_tried: 0,\n        probe_why: `an open dataset lists ${datasetHost}, but the name has no distinctive word to prove it with`,\n        stage_b_unverified: true,\n        website_checks: checks,\n      },\n    };\n  }\n  return {\n    json: {\n      ...biz,\n      probe_result: 'refused',\n      probe_looked: true,\n      probe_candidates_tried: 0,\n      probe_why: 'name has no distinctive word - refusing to guess',\n      website_checks: checks,\n    },\n  };\n}\n\n// --- 2. Candidate domains ---------------------------------------------------\nconst basis = core.length ? core : words;\nconst stem = basis.join('');\nconst firstWord = basis[0] || '';\nconst full = words.join('');\nconst hyphen = basis.join('-');\n\n// Country TLDs come from the search target, not from a constant. A Norwegian\n// salon is on .no far more often than .com, and trying .com first wastes the\n// probe budget on the wrong guesses.\nconst tlds = Array.isArray(biz.cctlds) && biz.cctlds.length\n  ? biz.cctlds\n  : ['.com'];\n\nconst candidates = [];\nfor (const s of [stem, firstWord, full, hyphen]) {\n  if (!s || s.length < 4) continue;\n  for (const t of tlds) {\n    const d = s + t;\n    if (!candidates.includes(d)) candidates.push(d);\n  }\n}\n\n// A domain the search stage already surfaced is the strongest candidate we\n// have, so it is probed first rather than after four guesses.\nif (biz.search_candidate_domain) {\n  const c = String(biz.search_candidate_domain).replace(/^https?:\\/\\//, '').replace(/\\/.*$/, '');\n  if (c) candidates.unshift(c);\n}\n\n// The dataset's own site goes ahead of everything: it is the claim this\n// business would otherwise be classified on, so it is the one to settle.\nif (datasetHost) {\n  const i = candidates.indexOf(datasetHost);\n  if (i >= 0) candidates.splice(i, 1);\n  candidates.unshift(datasetHost);\n}\nlet datasetUnreachable = false;\n\n// --- 3. Probe ---------------------------------------------------------------\nconst titleOf = (html) => {\n  const m = String(html).match(/<title[^>]*>([^]*?)<\\/title>/i);\n  //                                        ^^^ [^] is \"any character including\n  // newlines\" and contains no backslash. The obvious [\\s\\S] does not survive\n  // being written inside a single-quoted string - JS drops the backslash on an\n  // unknown escape, so it compiles as [sS] and matches only the letters s\n  // and S. That silently emptied every title in the job-hunt repo.\n  return m ? m[1].replace(/\\s+/g, ' ').trim().toLowerCase() : '';\n};\n\nconst PARKED = /(domain (is )?for sale|buy this domain|parked (free )?courtesy|this domain may be for sale|godaddy\\.com\\/domain|namecheap\\.com\\/domains|sedo\\.com|hugedomains)/;\n\nlet hit = '';\nlet hitText = '';\nlet why = '';\nlet looked = false;          // did ANY probe actually complete?\nlet tried = 0;\n\nfor (const cand of candidates.slice(0, MAX_PROBES)) {\n  tried++;\n  let html = '';\n  try {\n    html = await this.helpers.httpRequest({\n      url: 'https://' + cand,\n      method: 'GET',\n      timeout: TIMEOUT,\n      headers: { 'User-Agent': UA },\n    });\n  } catch (e) {\n    // A DNS failure is real evidence of absence. A timeout or a 403 is not:\n    // the site may exist and simply not want to talk to us. Only the former\n    // counts towards \"we looked\".\n    const msg = String(e && e.message || e);\n    const dnsMiss = /ENOTFOUND|EAI_AGAIN|getaddrinfo|NXDOMAIN/i.test(msg);\n    if (dnsMiss) looked = true;\n    record('probe.' + cand, 'https://' + cand,\n      dnsMiss ? 'not_found' : 'unreachable', { error: msg.slice(0, 200) });\n    // The dataset's site would not answer, so it can be neither proved nor\n    // refuted. It stays believed, as before, and guessing further domains\n    // could not change that verdict - so stop spending fetches.\n    if (cand === datasetHost && !dnsMiss) {\n      datasetUnreachable = true;\n      break;\n    }\n    continue;\n  }\n\n  looked = true;\n  const text = String(html || '').toLowerCase();\n\n  if (text.length < 500) {\n    record('probe.' + cand, 'https://' + cand, 'rejected', { why: 'page too short to judge' });\n    continue;\n  }\n  if (PARKED.test(text)) {\n    record('probe.' + cand, 'https://' + cand, 'rejected', { why: 'parked domain' });\n    continue;\n  }\n\n  const title = titleOf(text);\n  const bare = cand.replace(/\\.[a-z.]+$/, '');\n  if (!title || title === cand || title === bare) {\n    record('probe.' + cand, 'https://' + cand, 'rejected', { why: 'placeholder title' });\n    continue;\n  }\n\n  // --- does the domain actually stand for the whole name? -----------------\n  //\n  // The original rule keyed off `proof.length > 1`, which silently switched\n  // itself off whenever a name reduced to ONE distinctive word. \"Salong\n  // <Word>\" is such a name: \"salong\" is generic in this niche, leaving the one\n  // word. The candidate <word>.no then passed on a single title match - and\n  // that domain belonged to an energy company. Marking a real prospect HAS_WEBSITE drops them from the\n  // list permanently, which is the more expensive of the two mistakes.\n  //\n  // So the test is about COVERAGE, not token count: if the domain leaves part\n  // of the business name out, the page has to mention the missing part.\n  // Generic words count as corroboration here even though they are not proof\n  // on their own - a hairdresser's own site says \"salong\" somewhere, and an\n  // energy company's does not.\n  const local = cand.replace(/\\..*$/, '').replace(/-/g, '');\n  const omitted = words.filter((w) => w.length >= 3 && !local.includes(w));\n  if (omitted.length) {\n    const corroborated = omitted.some((w) => text.includes(w));\n    if (!corroborated) {\n      record('probe.' + cand, 'https://' + cand, 'rejected', {\n        why: 'domain covers only part of the name and the page never mentions the rest',\n        omitted, title: titleOf(text),\n      });\n      continue;\n    }\n  }\n\n  const inTitle = proof.filter((w) => title.includes(w)).length;\n  const inBody = proof.filter((w) => text.includes(w)).length;\n  const stemHit = stem.length >= 6 && text.includes(stem);\n\n  // How big a leap is this candidate?\n  //\n  // Two cases need the TITLE to name the business rather than merely\n  // containing one of its words somewhere on the page:\n  //\n  //   1. A domain built from one word out of several.\n  //\n  //   2. A domain that shares NO word with the business name at all. These\n  //      arrive from Stage C or an open dataset, and they are the dangerous ones,\n  //      because the thing a search most often turns up for a business with no\n  //      site is a DIRECTORY of that niche - and a directory of salons\n  //      contains precisely the words a salon's own site contains.\n  //\n  //      Measured: a lash-and-foot-spa salon was matched to\n  //      neglesalonger.com - Norwegian for \"nail salons\" - because a page\n  //      listing many salons naturally says \"lash\" and \"extensions\". That is a\n  //      false HAS_WEBSITE, and a false HAS_WEBSITE deletes a real prospect\n  //      from the list permanently.\n  const sharesNothing = !words.some((w) => w.length >= 4 && local.includes(w));\n  const guessedFromOneWord = (cand.startsWith(firstWord + '.') && proof.length > 1)\n                             || sharesNothing;\n\n  if (guessedFromOneWord) {\n    const named = proof.filter((w) => title.includes(w)).length;\n    if (named >= Math.min(2, proof.length)) {\n      hit = cand; hitText = text; why = 'short domain, and the page title names them';\n      record('probe.' + cand, 'https://' + cand, 'found', { title, matched_in_title: named });\n      break;\n    }\n    record('probe.' + cand, 'https://' + cand, 'rejected',\n      { why: 'one-word domain, title does not name them', title });\n    continue;\n  }\n\n  if (inTitle >= 1) {\n    hit = cand; hitText = text; why = 'named in the page title';\n    record('probe.' + cand, 'https://' + cand, 'found', { title, matched_in_title: inTitle });\n    break;\n  }\n  if (stemHit) {\n    hit = cand; hitText = text; why = 'full name appears on the page';\n    record('probe.' + cand, 'https://' + cand, 'found', { title });\n    break;\n  }\n  if (inBody >= 2) {\n    hit = cand; hitText = text; why = 'two distinctive words appear on the page';\n    record('probe.' + cand, 'https://' + cand, 'found', { title, matched_in_body: inBody });\n    break;\n  }\n\n  record('probe.' + cand, 'https://' + cand, 'rejected',\n    { why: 'page did not name the business', title });\n}\n\n// --- Is this site THEIRS, or just a site with the same name? ---------------\n//\n// A name match proves the name, not the business. An Oslo trading AS was\n// matched to the .com of a same-named Slovak fuel company, because the title\n// said \"<NAME> TRADING\". With sending automatic, that is an email\n// to the wrong company in the wrong country. So a found site is checked for\n// something only the real business would carry: its phone number (the last\n// eight digits, in any formatting) or at least two distinctive words of its\n// street address. The result is recorded, and CH-04 only auto-approves a\n// draft whose site was corroborated - anything else waits for a human.\nconst foldText = (s) => String(s || '').toLowerCase()\n  .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n  .replace(/\\u00f8/g, 'o').replace(/\\u00e6/g, 'ae').replace(/\\u00e5/g, 'a')\n  .replace(/[^a-z0-9]+/g, ' ');\nconst ADDRESS_NOISE = new Set([\n  'office', 'floor', 'street', 'building', 'tower', 'road', 'suite', 'level',\n  'dubai', 'united', 'arab', 'emirates', 'norway', 'norge', 'oslo', 'sharjah',\n]);\nconst corroborate = (page) => {\n  const digits = String(biz.phone_e164 || '').replace(/[^0-9]/g, '');\n  if (digits.length >= 8) {\n    const tail = digits.slice(-8).split('').join('[^0-9a-z]{0,2}');\n    if (new RegExp('(^|[^0-9])' + tail + '([^0-9]|$)').test(String(page))) return 'phone';\n  }\n  const words = [...new Set(foldText(biz.address).split(' ')\n    .filter((w) => w.length >= 5 && !/^[0-9]+$/.test(w) && !ADDRESS_NOISE.has(w)))];\n  if (words.length) {\n    const hay = ' ' + foldText(page) + ' ';\n    const seen = words.filter((w) => hay.includes(' ' + w + ' ')).length;\n    if (seen >= Math.min(2, words.length)) return 'address';\n  }\n  return 'none';\n};\n\n// --- 4. What became of the dataset's site? ----------------------------------\nconst datasetCheck = datasetHost\n  ? checks.find((c) => c.stage === 'probe' && c.candidate_url === 'https://' + datasetHost)\n  : null;\nif (datasetCheck) {\n  datasetCheck.evidence = { ...datasetCheck.evidence, source: 'open dataset', dataset_url: datasetUrl };\n}\n\nif (datasetUnreachable) {\n  return {\n    json: {\n      ...biz,\n      probe_result: 'skipped',\n      probe_looked: false,\n      probe_candidates_tried: tried,\n      probe_why: `an open dataset lists ${datasetHost}, which did not answer - it could not be proved or refuted`,\n      stage_b_unverified: true,\n      website_checks: checks,\n    },\n  };\n}\n\n// Fetched and not theirs (or no longer resolving). The dataset site stops\n// counting as their website, and - just as important - the dataset match it\n// came from stops counting as evidence they have NO website: it matched\n// somebody else. classify-website.js reads stage_b_disproved for exactly that.\nconst disproved = datasetHost && hit !== datasetHost\n  ? {\n    stage_b_website: '',\n    stage_b_disproved: datasetUrl,\n    stage_b_disproved_why: (datasetCheck && datasetCheck.evidence && datasetCheck.evidence.why)\n      || (datasetCheck && datasetCheck.outcome === 'not_found' ? 'domain does not resolve' : 'not proved'),\n  }\n  : {};\n\nconst corroboration = hit ? corroborate(hitText) : 'none';\nif (hit) {\n  const foundCheck = checks.find((c) => c.stage === 'probe' && c.outcome === 'found'\n    && c.candidate_url === 'https://' + hit);\n  if (foundCheck) foundCheck.evidence = { ...foundCheck.evidence, corroborated: corroboration };\n  return {\n    json: {\n      ...biz,\n      ...disproved,\n      probe_result: 'found',\n      probe_looked: true,\n      probe_candidates_tried: tried,\n      probe_domain: hit,\n      probe_url: 'https://' + hit,\n      probe_why: hit === datasetHost ? `the open dataset's site - ${why}` : why,\n      probe_corroborated: corroboration,\n      website_checks: checks,\n    },\n  };\n}\n\n// Nothing found. Whether that MEANS anything depends entirely on whether we\n// managed to look. This distinction is the whole safeguard.\nreturn {\n  json: {\n    ...biz,\n    ...disproved,\n    probe_result: looked ? 'not_found' : 'unreachable',\n    probe_looked: looked,\n    probe_candidates_tried: tried,\n    probe_why: looked\n      ? `probed ${tried} candidate domain(s), none proved to belong to this business`\n      : `probed ${tried} candidate domain(s) and could not reach any of them - this proves nothing`,\n    website_checks: checks,\n  },\n};\n"
+      },
+      "id": "ch02-stage-d",
+      "name": "Stage D: prove the domain",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        980,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// CH-02, node: \"Stage E: is the site any good?\"\n// Mode: Run Once for Each Item\n//\n// Only runs when a website was actually established. Turns \"they have a site\"\n// into \"they have a site that loads in 11 seconds on a phone and has no\n// HTTPS\", which is a different and frequently better sales conversation: the\n// owner already believes a website matters, so the argument is about quality\n// rather than about whether to have one at all.\n//\n// PageSpeed Insights is free - 25,000 requests a day - but that quota is\n// shared globally across all callers rather than granted per key, so it is a\n// soft limit. A failure here degrades the lead to a plain HAS_WEBSITE; it\n// never blocks the pipeline and never invents a score.\n\nconst b = $json;\nconst CFG = $('Config').first().json;\n\nconst url = b.probe_result === 'found'\n  ? 'https://' + b.probe_domain\n  : (b.stage_a_url || b.stage_b_website || '');\n\nif (!url) {\n  return { json: { ...b, psi: null } };\n}\n\nconst checks = [...(b.website_checks || [])];\n\n// HTTPS is KNOWN only when the site was actually fetched over HTTPS - which is\n// exactly what Stage D does when it proves a domain. An http:// address we\n// merely hold proves nothing: the open datasets store most addresses as\n// http:// whether or not the site redirects to HTTPS.\n//\n// Reading the scheme off the stored URL made every one of the first 30\n// WEAK_WEBSITE leads weak for the same reason, \"no HTTPS\" - and their drafts\n// told working, secure sites they \"could be working harder\". Unknown is\n// recorded as null, which the classifier treats as no evidence either way.\nconst https = b.probe_result === 'found' || /^https:/i.test(url) ? true : null;\n\nlet psi = { https, performance: 0, mobile_friendly: null, measured: false };\n\nconst key = CFG.pagespeed_api_key || '';\ntry {\n  // Built by hand: the Code node sandbox has no URLSearchParams, any more than\n  // it has URL. This line used `new URLSearchParams(...)`, which threw on every\n  // call - so PageSpeed never measured a single site in production, and every\n  // \"weak website\" verdict rested on the http:// scheme alone. The evidence\n  // rows said so (\"URLSearchParams is not defined\") and nobody read them.\n  const params = { url, strategy: 'mobile', category: 'performance' };\n  if (key) params.key = key;\n  const q = Object.keys(params)\n    .map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))\n    .join('&');\n\n  const res = await this.helpers.httpRequest({\n    method: 'GET',\n    url: 'https://www.googleapis.com/pagespeedonline/v5/runPagespeed?' + q,\n    json: true,\n    timeout: Number(CFG.psi_timeout_ms || 60000),\n  });\n\n  const lh = res && res.lighthouseResult;\n  const score = lh && lh.categories && lh.categories.performance\n    ? Number(lh.categories.performance.score) * 100\n    : 0;\n\n  // A viewport audit that fails is the clearest single signal of a site built\n  // before phones mattered, which is most of what this project will find.\n  const viewport = lh && lh.audits && lh.audits['viewport'];\n  const mobileFriendly = viewport ? viewport.score !== 0 : null;\n\n  psi = {\n    https,\n    performance: score,\n    mobile_friendly: mobileFriendly,\n    measured: true,\n    final_url: lh && lh.finalUrl,\n  };\n\n  checks.push({\n    stage: 'quality', method: 'pagespeed.mobile', candidate_url: url, outcome: 'found',\n    evidence: { performance: score, mobile_friendly: mobileFriendly, https },\n  });\n} catch (e) {\n  // Unmeasured is not \"fine\" and not \"bad\". It is unmeasured, and the\n  // classifier treats a missing performance number as no evidence either way\n  // rather than as a passing grade.\n  checks.push({\n    stage: 'quality', method: 'pagespeed.mobile', candidate_url: url, outcome: 'unreachable',\n    evidence: { error: String(e && e.message || e).slice(0, 200), https },\n  });\n}\n\nreturn { json: { ...b, psi, website_checks: checks } };\n"
+      },
+      "id": "ch02-stage-e",
+      "name": "Stage E: is the site any good?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// CH-02, node: \"Classify and score confidence\"\n// Mode: Run Once for Each Item\n//\n// The verdict. Takes the evidence gathered by Stages A-D and produces a\n// website_status plus a confidence number.\n//\n// The governing rule of this project:\n//\n//     A missing website field is not evidence of no website.\n//     \"No website\" is a positive claim and needs positive evidence.\n//\n// So confidence is COMPUTED FROM WHICH CHECKS ACTUALLY COMPLETED, never\n// asserted. A business we could not look up, could not search for and could\n// not probe scores low no matter how empty its Maps listing was.\n//\n// There is deliberately no model in this path. The classification gates real\n// money and a real email to a real business, so it has to give the same\n// answer twice.\n\nconst b = $json;\n\n// --- inputs from the earlier stages ----------------------------------------\n// Stage A: what the Maps listing said, after platform domains were discounted\nconst sourceClaim = b.stage_a_claim || 'absent';   // 'absent' | 'platform' | 'real'\nconst sourceUrl = b.stage_a_url || '';\nconst isSocialOnly = Boolean(b.stage_a_social_only);\n\n// Stage B: the free datasets\nconst datasetChecked = Boolean(b.stage_b_checked);   // did we find the business at all\nconst datasetWebsite = b.stage_b_website || '';      // a site they hold for it\nconst datasetMatched = Boolean(b.stage_b_matched);\n\n// Stage C: search\nconst searchRan = Boolean(b.stage_c_ran);\nconst searchFound = b.stage_c_candidate || '';\n\n// Stage D: the probe\nconst probeResult = b.probe_result || 'skipped';     // found|not_found|unreachable|refused\nconst probeLooked = Boolean(b.probe_looked);\nconst probeTried = Number(b.probe_candidates_tried || 0);\nconst probeDomain = b.probe_domain || '';\n\n// Stage E-quality: PageSpeed, only run when a site was proved\nconst psi = b.psi || null;\n\nlet status = 'WEBSITE_UNCERTAIN';\nlet confidence = 0.4;\nlet evidence = '';\n\n// ---------------------------------------------------------------------------\n//  1. A proved site ends the question.\n// ---------------------------------------------------------------------------\nif (probeResult === 'found' || sourceClaim === 'real' || datasetWebsite) {\n  const url = probeDomain ? 'https://' + probeDomain : (sourceUrl || datasetWebsite);\n\n  // Weak counts as a different, often better, lead: the owner has already\n  // decided a website matters, which is the hardest part of the sale, and has\n  // something that does not work.\n  const weak = [];\n  if (psi) {\n    if (Number(psi.performance) > 0 && Number(psi.performance) < 50) {\n      weak.push(`mobile performance ${Math.round(psi.performance)}/100`);\n    }\n    if (psi.https === false) weak.push('no HTTPS');\n    if (psi.mobile_friendly === false) weak.push('not mobile friendly');\n  }\n  if (/wixsite\\.com|blogspot\\.com|godaddysites\\.com|webnode|jimdosite/.test(url)) {\n    weak.push('free builder subdomain, no custom domain');\n  }\n\n  if (weak.length) {\n    status = 'WEAK_WEBSITE';\n    confidence = 0.85;\n    evidence = `Has a site (${url}) but it is weak: ${weak.join('; ')}.`;\n  } else {\n    status = 'HAS_WEBSITE';\n    // A site proved by probe is better evidence than one merely listed in a\n    // dataset we never fetched - and a dataset site Stage D tried and could\n    // not prove (it did not answer, or the name had nothing distinctive to\n    // check) is weaker still, because the dataset match itself may be a\n    // neighbour that shares their phone number.\n    confidence = probeResult === 'found' ? 0.95 : b.stage_b_unverified ? 0.7 : 0.85;\n    evidence = probeResult === 'found'\n      ? `Website proved: ${url} - ${b.probe_why}.`\n      : b.stage_b_unverified\n        ? `Website listed by an open dataset but never proved to be theirs: ${url} (${b.probe_why}).`\n        : `Website listed by ${sourceClaim === 'real' ? 'the Maps listing' : 'an open dataset'}: ${url}.`;\n  }\n}\n\n// ---------------------------------------------------------------------------\n//  2. No site found. How hard did we actually look?\n//\n//  Four independent checks can support a \"no website\" claim:\n//     A  the listing itself carried nothing usable\n//     B  neither open dataset holds a site for them\n//     C  a search turned up no candidate\n//     D  domain guesses were probed and refused\n//\n//  Each one that COMPLETED adds confidence. Each one that could not run\n//  leaves it lower, which is the point - it is the difference between\n//  \"we checked and found nothing\" and \"we could not check\".\n// ---------------------------------------------------------------------------\nelse {\n  let score = 0;\n  const had = [];\n  const missing = [];\n\n  // A - always available, so worth the least on its own.\n  if (sourceClaim === 'absent' || sourceClaim === 'platform') {\n    score += 0.25;\n    had.push(sourceClaim === 'platform'\n      ? 'the Maps listing points at a social or directory page, not a site'\n      : 'the Maps listing has no website');\n  }\n\n  // B - the strongest single check, because it is independent of Google.\n  //\n  // Except when Stage D fetched the site the dataset held for its match and\n  // found it belongs to somebody else. Then the match was to the wrong place -\n  // usually a neighbour sharing the phone number - and it is evidence of\n  // nothing about THIS business, in either direction. Crediting it as \"the\n  // dataset holds no website for them\" would turn a wrong match into a\n  // confident no-website pitch.\n  if (b.stage_b_disproved) {\n    missing.push(`the open-dataset match turned out to be another business ` +\n      `(its site ${b.stage_b_disproved} is not theirs), so it says nothing either way`);\n  } else if (datasetChecked && datasetMatched && !datasetWebsite) {\n    score += 0.30;\n    had.push('matched in an open dataset, which also holds no website for them');\n  } else if (datasetChecked && !datasetMatched) {\n    // Not finding the business at all is weak evidence either way. In Dubai\n    // this will be the common case, and pretending otherwise is how a\n    // region with thin data quietly gets a confident wrong answer.\n    score += 0.05;\n    missing.push('not present in the open datasets, so they could not confirm or deny');\n  } else {\n    missing.push('open datasets not consulted');\n  }\n\n  // C\n  //\n  // A search that found a candidate which Stage D then REFUTED is stronger\n  // evidence than a search that found nothing at all: we looked, we found the\n  // most plausible thing on the internet, we fetched it, and it was somebody\n  // else's. The first version credited only the empty-handed case, so the\n  // better outcome scored zero.\n  //\n  // On the first 30 real businesses this was the single biggest reason nothing\n  // reached CONFIRMED: Stage C found a candidate for 22 of them and Stage D\n  // refused 16, and all 16 were treated as though no search had happened.\n  if (searchRan && !searchFound) {\n    score += 0.20;\n    had.push('a web search for them returned no site of their own');\n  } else if (searchRan && searchFound && probeResult === 'not_found' && probeLooked) {\n    score += 0.20;\n    had.push(`a web search suggested ${searchFound}, which was fetched and is not theirs`);\n  } else if (searchRan && searchFound) {\n    // Found something and could not resolve it. Genuinely unknown.\n    missing.push(`a web search suggested ${searchFound}, which could not be checked`);\n  } else if (!searchRan) {\n    missing.push('no web search was run');\n  }\n\n  // D - refusing to guess is honest, but it is not evidence of absence.\n  if (probeResult === 'not_found' && probeLooked && probeTried >= 4) {\n    score += 0.25;\n    had.push(`${probeTried} likely domains were checked and none belongs to them`);\n  } else if (probeResult === 'not_found' && probeLooked) {\n    score += 0.12;\n    had.push(`${probeTried} likely domain(s) were checked and none belongs to them`);\n  } else if (probeResult === 'unreachable') {\n    missing.push('domain probes could not complete, which proves nothing either way');\n  } else if (probeResult === 'refused') {\n    missing.push('the name has no distinctive word, so no domain could be tested');\n  }\n\n  confidence = Math.min(1, Number(score.toFixed(2)));\n\n  if (confidence >= 0.85) {\n    status = 'NO_WEBSITE_CONFIRMED';\n  } else if (confidence >= 0.60) {\n    status = 'NO_WEBSITE_LIKELY';\n  } else {\n    status = 'WEBSITE_UNCERTAIN';\n  }\n\n  const parts = [];\n  if (had.length) parts.push('Checked: ' + had.join('; ') + '.');\n  if (missing.length) parts.push('Not established: ' + missing.join('; ') + '.');\n  if (isSocialOnly) {\n    parts.push('They are active on social media with nowhere to send people - a strong sign they want a web presence.');\n  }\n  evidence = parts.join(' ');\n}\n\n// ---------------------------------------------------------------------------\n//  3. Overrides that no amount of confidence can talk its way past.\n// ---------------------------------------------------------------------------\nif (b.permanently_closed) {\n  status = 'INVALID';\n  confidence = 1.0;\n  evidence = 'Permanently closed.';\n}\n\nreturn {\n  json: {\n    ...b,\n    website_status: status,\n    website_confidence: confidence,\n    website_url: probeDomain ? 'https://' + probeDomain : (sourceUrl || datasetWebsite || null),\n    website_evidence: evidence,\n    website_checked_at: new Date().toISOString(),\n  },\n};\n"
+      },
+      "id": "ch02-classify",
+      "name": "Classify and score confidence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// CH-02, node: \"Stage F: find a contact email\"\n// Mode: Run Once for Each Item\n//\n// Only runs for businesses a real website was found for. For the businesses\n// this project actually wants to reach - the ones with NO website - there is\n// nowhere for this stage to look, and it correctly finds nothing.\n//\n// That asymmetry is worth being honest about up front: the leads highest in\n// value here (confirmed no website) are structurally the leads least likely\n// to have a discoverable email. This stage does not solve that; it only\n// stops HAS_WEBSITE and WEAK_WEBSITE leads from being emailed blind.\n\nconst b = $json;\nconst CFG = $('Config').first().json;\n\nconst eligible = b.website_status === 'HAS_WEBSITE' || b.website_status === 'WEAK_WEBSITE';\nif (!eligible || !b.website_url) {\n  return { json: { ...b, contact_email: '', contact_email_source: 'not_applicable' } };\n}\n\nconst UA = CFG.user_agent ||\n  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';\n\n// Addresses that exist on a page but are not a real contact route. Image\n// CDNs and theme boilerplate leave these behind constantly - sentry.io error\n// reporting addresses, wixpress placeholder accounts, and the literal\n// \"you@example.com\" every contact-form tutorial copies verbatim.\nconst JUNK = /^(no-?reply|do-?not-?reply|postmaster|mailer-daemon|abuse|webmaster|sentry|test|admin@wixpress|wix@wix)/i;\n// example.com/.org/.net are RFC 2606 reserved for documentation - every\n// \"you@example.com\" copied verbatim out of a contact-form tutorial lands\n// here. Caught by DOMAIN, not by the local-part prefix list above: the first\n// version only checked the start of the address (\"^example\"), which matches\n// \"example@...\" but not \"you@example.com\" - the reserved word is on the\n// other side of the @. Confirmed missed on a fixture built for exactly this.\n// company.com is the same shape of problem with a different literal - the\n// generic placeholder every \"you@company.com\" contact-form template ships\n// with. Found for real on an Oslo salon's site.\n// Template placeholders in other languages and shapes too: name@domaine.com\n// (French \"domaine\") was found on a real Oslo business's site, alongside the\n// usual you@yourdomain.com / mail@yoursite.com family.\nconst JUNK_DOMAIN = /\\.(png|jpg|jpeg|gif|svg|webp|heic|avif|bmp|tiff?|ico)$|sentry\\.io|wixpress\\.com|godaddy\\.com|schema\\.org|example\\.(com|org|net)$|(?<![a-z0-9-])company\\.com$|(?<![a-z0-9-])(your-?)?(domaine?|site|website|email)\\.(com|net|org)$/i;\n\n// A real-world TLD allowlist, not an attempt at RFC completeness. The bare\n// character class below has no length limit, so it will happily swallow run-\n// on text with no separator into what it treats as the TLD - found for real\n// as \"<name>@<company>.commob\" (the page read \"...<company>.com\n// mob:+971...\" with no space) and as an image filename's \"@2x\" resolution\n// suffix parsed as a whole address (\"...600x600@2x.heic\" -> domain \"2x.heic\").\n// Neither \"commob\" nor \"heic\" is a real TLD; checking against a known list\n// catches both classes at once without trying to regex-detect run-on text\n// directly, which the JUNK_DOMAIN extension list above cannot do (a length\n// bound alone would not reject \"commob\" - six letters is a perfectly\n// ordinary TLD length). An unrecognised TLD is refused outright rather than\n// guessed at (e.g. trimmed back to \"com\") - the same \"refuse rather than\n// guess\" rule Stage D applies to domain candidates.\nconst KNOWN_TLDS = new Set([\n  'com', 'net', 'org', 'info', 'biz', 'co', 'io', 'me', 'tv', 'app',\n  'shop', 'store', 'studio', 'online', 'xyz',\n  'no', 'se', 'dk', 'ae', 'sa', 'qa', 'es', 'it', 'pt', 'ca',\n]);\nconst hasKnownTld = (addr) => {\n  const tld = addr.split('.').pop();\n  return KNOWN_TLDS.has(tld);\n};\n\nconst EMAIL_RE = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g;\n\nconst isJunk = (addr) => JUNK.test(addr) || JUNK_DOMAIN.test(addr) || !hasKnownTld(addr);\n\nconst extract = (html) => {\n  const found = new Set();\n  const text = String(html || '');\n  // mailto: links are the strongest signal - the page author put this there\n  // on purpose, as opposed to an address that merely appears in a script tag\n  // or a tracking pixel URL. That does not make a mailto: link immune to\n  // junk, though - a template's placeholder contact link is still a mailto:\n  // link - so the same filter applies here too, not only to plain page text.\n  const mailtoRe = /mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})/gi;\n  let m;\n  const mailtos = new Set();\n  while ((m = mailtoRe.exec(text))) {\n    const addr = m[1].toLowerCase();\n    if (isJunk(addr)) continue;\n    mailtos.add(addr);\n  }\n\n  // The page-text pass reads only what a visitor can SEE. Scripts, styles,\n  // comments and meta tags carry addresses nobody published as a contact -\n  // found for real on a Dubai property agency's site, whose only address was\n  // the WordPress author account in its JSON-LD metadata (the site builder's\n  // gmail). The draft would have told the person who built the site that the\n  // site was weak.\n  const visible = text\n    .replace(/<script\\b[^>]*>[^]*?<\\/script>/gi, ' ')\n    .replace(/<style\\b[^>]*>[^]*?<\\/style>/gi, ' ')\n    .replace(/<!--[^]*?-->/g, ' ')\n    .replace(/<meta\\b[^>]*>/gi, ' ');\n\n  let g;\n  while ((g = EMAIL_RE.exec(visible))) {\n    const addr = g[0].toLowerCase();\n    if (isJunk(addr)) continue;\n    found.add(addr);\n  }\n  return { mailtos, all: found };\n};\n\n// Best match: an address on the business's OWN domain beats a generic gmail\n// address beats nothing. A gmail/outlook address is common for a one-person\n// salon and is not itself a red flag the way it would be for a company site.\nconst pickBest = (candidates, domain) => {\n  const onDomain = [...candidates].filter((a) => domain && a.endsWith('@' + domain));\n  if (onDomain.length) return onDomain[0];\n  return candidates.size ? [...candidates][0] : '';\n};\n\n// No working URL constructor in the sandbox (proven in production - see\n// merge-stage-b.js), so both the host and the contact-page URLs below are\n// built by string work instead. Previously the catch here left `domain`\n// blank, which silently disabled the \"prefer an address on the business's\n// own domain\" rule.\nconst splitUrl = (url) => {\n  const s = String(url || '').trim();\n  const withScheme = /^[a-z][a-z0-9+.-]*:\\/\\//i.test(s) ? s : 'https://' + s;\n  const scheme = withScheme.slice(0, withScheme.indexOf('://') + 3);\n  const rest = withScheme.slice(scheme.length);\n  const hostPart = rest.split(/[/?#]/)[0];\n  return { origin: scheme + hostPart, host: hostPart.split('@').pop().split(':')[0].toLowerCase() };\n};\n\nconst parsed = splitUrl(b.website_url);\nconst domain = parsed.host.replace(/^www\\./, '');\n\nconst checks = [...(b.website_checks || [])];\nlet email = '';\nlet source = 'not_found';\n\nconst pagesToTry = [b.website_url];\n// A contact page is worth one extra fetch: many sites keep the email off the\n// homepage entirely. Norwegian and English paths cover both target markets.\nfor (const path of ['/contact', '/contact-us', '/kontakt', '/about']) {\n  // Was `new URL(path, b.website_url)`, which threw every time, so this list\n  // never grew past the homepage and the contact pages - where a small\n  // business most often puts its address - were never fetched at all.\n  if (parsed.origin) pagesToTry.push(parsed.origin + path);\n}\n\nfor (const url of pagesToTry.slice(0, 3)) {   // homepage + at most two more\n  let html;\n  try {\n    html = await this.helpers.httpRequest({\n      url, method: 'GET', timeout: Number(CFG.probe_timeout_ms || 9000),\n      headers: { 'User-Agent': UA },\n    });\n  } catch (e) {\n    checks.push({ stage: 'quality', method: 'email.' + url, candidate_url: url,\n                  outcome: 'unreachable', evidence: { error: String(e.message || e).slice(0, 150) } });\n    continue;\n  }\n\n  const { mailtos, all } = extract(html);\n  const best = pickBest(mailtos, domain) || pickBest(all, domain);\n  if (best) {\n    email = best;\n    source = mailtos.has(best) ? 'mailto_link' : 'page_text';\n    checks.push({ stage: 'quality', method: 'email.' + url, candidate_url: url,\n                  outcome: 'found', evidence: { email: best, via: source } });\n    break;\n  }\n  checks.push({ stage: 'quality', method: 'email.' + url, candidate_url: url,\n                outcome: 'not_found', evidence: {} });\n}\n\nreturn {\n  json: {\n    ...b,\n    contact_email: email,\n    contact_email_source: source,\n    website_checks: checks,\n  },\n};\n"
+      },
+      "id": "ch02-stage-f",
+      "name": "Stage F: find a contact email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1640,
+        290
+      ],
+      "notes": "Only runs for HAS_WEBSITE / WEAK_WEBSITE leads - a business with a real site is the only place this can look. A confirmed no-website lead correctly gets no email here; that gap is real, not a bug, and is why outreach for those leads should default to phone."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-02: record the verdict and the evidence that produced it.\n--\n-- Two writes in one statement, deliberately atomic:\n--\n--   1. website_checks gets every check that ran, append-only. This is what\n--      makes a classification auditable and, more usefully, RE-DERIVABLE: if\n--      the confidence thresholds change, old rows can be re-scored offline\n--      without re-scraping or re-paying for anything.\n--\n--   2. businesses gets the verdict itself.\n--\n-- The WHERE clause on the UPDATE is a guard, not decoration. A verdict is\n-- only written over PENDING. If two CH-02 executions overlap - which a\n-- 30-minute schedule and a slow probe batch make entirely possible - the\n-- second one finds the row already decided and leaves it alone rather than\n-- overwriting a verdict with a staler one.\n\nWITH ins AS (\n  INSERT INTO website_checks (business_id, stage, method, candidate_url, outcome, evidence)\n  SELECT\n    $1::bigint,\n    c ->> 'stage',\n    c ->> 'method',\n    NULLIF(c ->> 'candidate_url', ''),\n    c ->> 'outcome',\n    COALESCE(c -> 'evidence', '{}'::jsonb)\n  FROM jsonb_array_elements($2::jsonb) AS c\n  RETURNING 1\n)\nUPDATE businesses SET\n  website_status     = $3,\n  website_confidence = $4,\n  website_url        = NULLIF($5, ''),\n  website_evidence   = $6,\n  website_checked_at = now(),\n  -- $7 is Stage F's finding, if it ran. COALESCE onto the existing value so a\n  -- re-verify never erases an email a human or an earlier run already found.\n  email               = COALESCE(NULLIF($7, ''), businesses.email)\nWHERE id = $1::bigint\n  AND website_status = 'PENDING'\nRETURNING id, website_status, website_confidence;\n-- The count of inserted checks is deliberately NOT returned. Referencing a\n-- data-modifying CTE from the outer RETURNING is subtle enough to be worth\n-- avoiding for a number nothing reads; the CTE still runs either way, because\n-- Postgres always executes a data-modifying CTE whether or not it is\n-- referenced.\n",
+        "options": {
+          "queryReplacement": "={{ [$json.id, JSON.stringify($json.website_checks || []), $json.website_status, $json.website_confidence, $json.website_url || '', $json.website_evidence, $json.contact_email || ''] }}"
+        }
+      },
+      "id": "ch02-write",
+      "name": "Write the verdict and the evidence",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1860,
+        290
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-02, node: \"What did verification decide?\"\n// Mode: Run Once for All Items\n//\n// The report that tells you whether the core claim of this project is holding\n// up. It deliberately leads with the numbers that would reveal it failing.\n\nconst rows = $('Classify and score confidence').all().map((i) => i.json);\n\nif (!rows.length) {\n  // Nothing pending is the steady state once a market is fully verified. It\n  // is the system idling correctly and must not read as a fault.\n  return [{ json: { quiet: true, message: 'CH-02: nothing waiting to be verified.' } }];\n}\n\nconst by = (s) => rows.filter((r) => r.website_status === s).length;\n\nconst confirmed = by('NO_WEBSITE_CONFIRMED');\nconst likely = by('NO_WEBSITE_LIKELY');\nconst weak = by('WEAK_WEBSITE');\nconst has = by('HAS_WEBSITE');\nconst uncertain = by('WEBSITE_UNCERTAIN');\nconst invalid = by('INVALID');\n\n// The single most important number in the project.\n//\n// Every one of these is a business whose Maps listing claimed no website and\n// which turned out to have one. Stage A alone would have shipped all of them\n// as leads, and each would have produced an email opening \"I noticed you\n// don't have a website\" to somebody who does.\n//\n// If this number is near zero, the cross-check stages are not earning their\n// place. If it is large, they are the reason the list is worth anything.\nconst caughtByCrossCheck = rows.filter(\n  (r) => r.stage_a_claim !== 'real' && (r.website_status === 'HAS_WEBSITE' || r.website_status === 'WEAK_WEBSITE')\n).length;\n\nconst caughtByDataset = rows.filter(\n  (r) => r.stage_a_claim !== 'real' && r.stage_b_website\n).length;\nconst caughtByProbe = rows.filter(\n  (r) => r.stage_a_claim !== 'real' && !r.stage_b_website && r.probe_result === 'found'\n).length;\n\n// Probes that could not complete. These are the rows where we genuinely do\n// not know, and they are held back from qualification rather than guessed at.\nconst unreachable = rows.filter((r) => r.probe_result === 'unreachable').length;\nconst refused = rows.filter((r) => r.probe_result === 'refused').length;\n\nconst pct = (n) => (rows.length ? Math.round((n / rows.length) * 100) : 0);\n\nconst lines = [\n  `CH-02 verified ${rows.length}`,\n  '',\n  `${confirmed} no website (confirmed)`,\n  `${likely} no website (likely)`,\n  `${weak} weak website`,\n  `${has} has a working website`,\n  `${uncertain} uncertain - held for review`,\n];\nif (invalid) lines.push(`${invalid} invalid or closed`);\n\nlines.push('');\nlines.push(`False positives caught: ${caughtByCrossCheck} (${pct(caughtByCrossCheck)}%)`);\nlines.push(`  ${caughtByDataset} by the free datasets, ${caughtByProbe} by probing`);\n\nif (unreachable || refused) {\n  lines.push('');\n  lines.push(`Could not establish: ${unreachable} unreachable, ${refused} unprovable name`);\n}\n\n// A cross-check catch rate of zero means one of two things, and they need\n// different fixes, so the report says which to check rather than leaving it\n// as a number to interpret.\nif (caughtByCrossCheck === 0 && rows.length >= 20) {\n  lines.push('');\n  lines.push('No false positives caught at all. Either the reference tables are empty for this city, or Maps is unusually accurate here. Check: SELECT count(*) FROM ref_overture_places WHERE lower(city) = ...');\n}\n\n// Search failing. Serper answers 400 when the account is out of credits,\n// and from then on Stage C cannot run: leads stop reaching LIKELY and stop\n// being emailed, silently. That is the one thing here worth a message.\nconst searchFailed = rows.filter((r) => (r.website_checks || []).some((c) =>\n  c.stage === 'search' && c.evidence && /40[0-3]|credit/i.test(String(c.evidence.error || '')))).length;\n\n// CH-02 runs every 5 minutes. A Telegram message per run was a dozen an\n// hour - noise that buries the messages that matter (sends, replies,\n// bounces). So it stays quiet unless search is failing, and even then\n// speaks at most once an hour.\nconst alertSearch = searchFailed > 0 && new Date().getUTCMinutes() < 5;\nif (alertSearch) {\n  lines.unshift(`SEARCH IS FAILING for ${searchFailed} of ${rows.length} - the Serper account is ` +\n    'probably out of credits. New leads cannot be verified as no-website until it is topped up ' +\n    'or another key is set (SERPER_API_KEY, then re-import the workflows).', '');\n}\n\nreturn [{\n  json: {\n    quiet: !alertSearch,\n    search_failed: searchFailed,\n    total: rows.length,\n    confirmed, likely, weak, has, uncertain,\n    caught_by_cross_check: caughtByCrossCheck,\n    message: lines.join('\\n'),\n  },\n}];\n"
+      },
+      "id": "ch02-summary",
+      "name": "What did verification decide?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "q1",
+              "leftValue": "={{ $json.quiet }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch02-worth-saying",
+      "name": "Is this worth a message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2300,
+        290
+      ],
+      "notes": "This runs 48 times a day. Reporting 'nothing to verify' every half hour trains you to scroll past the message, and then you scroll past the one that matters."
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch02-telegram",
+      "name": "Tell me",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2520,
+        290
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-02 \u2014 Verify the website gap\n\n**This is the workflow the project stands or falls on.**\n\nCH-01 produces candidates. A candidate is a business whose Google Maps listing carries no website field. That is *not* the same as a business without a website, and the entire value of the lead list depends on the difference.\n\n### The five stages, cheapest first\n\n| | Stage | Costs | Catches |\n|---|---|---|---|\n| A | What did the listing claim? | free | social-only, Linktree, dead `business.site` |\n| B | Cross-check Overture + Foursquare | **free, unlimited** | the owner has a site, just never added it to Maps |\n| C | Search for them | ~$0.001 | a site under a name we would never guess |\n| D | Guess a domain and **prove** it | free | the rest |\n| E | PageSpeed | free | a site that exists but is unusable |\n| F | Find a contact email | free | only possible for HAS_WEBSITE / WEAK_WEBSITE - a confirmed no-website lead has nowhere for this to look, which is why outreach for those defaults to phone |\n\nEach stage that *completes* adds confidence. Each stage that cannot run leaves it lower. That is the whole mechanism:\n\n> **\"We checked and found nothing\" and \"we could not check\" must never produce the same number.**\n\n### Why there are no IF branches here\n\nEvery stage skips itself when an earlier one already settled the question. The flow stays linear, so there are no Merge nodes and no item-pairing bugs \u2014 the failure mode where one business's answer gets attached to another business.\n\nStage B re-pairs **by place id, not by position**, for the same reason.\n\n### Setup\n\n1. Load the reference data first \u2014 Stage B is worthless against empty tables:\n   ```\n   python tools/load_overture.py --city Oslo --country Norway\n   python tools/load_fsq.py --city Oslo --country Norway\n   ```\n2. Optional: a Serper key in `Config` enables Stage C. Without it the pipeline still works, but confidence caps lower and fewer leads reach CONFIRMED. That is correct behaviour, not a bug.\n3. Optional: a PageSpeed key raises the rate limit. The API works without one.\n\n### Read this number in the report\n\n**\"False positives caught\"** \u2014 businesses whose listing said no website and which turned out to have one. Every one of those is an email that would have opened *\"I noticed you don't have a website\"* to somebody who does. If that number is zero on a batch of 20+, check the reference tables are actually populated for that city.",
+        "height": 900,
+        "width": 640,
+        "color": 5
+      },
+      "id": "ch02-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1520,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Load platform domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load platform domains": {
+      "main": [
+        [
+          {
+            "node": "Pick what needs checking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick what needs checking": {
+      "main": [
+        [
+          {
+            "node": "Stage A: what did the source actually claim?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage A: what did the source actually claim?": {
+      "main": [
+        [
+          {
+            "node": "Stage B: cross-check the open datasets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage B: cross-check the open datasets": {
+      "main": [
+        [
+          {
+            "node": "Stage B: what do the free datasets say?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage B: what do the free datasets say?": {
+      "main": [
+        [
+          {
+            "node": "Stage C: search for them",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage C: search for them": {
+      "main": [
+        [
+          {
+            "node": "Stage D: prove the domain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage D: prove the domain": {
+      "main": [
+        [
+          {
+            "node": "Stage E: is the site any good?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage E: is the site any good?": {
+      "main": [
+        [
+          {
+            "node": "Classify and score confidence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify and score confidence": {
+      "main": [
+        [
+          {
+            "node": "Stage F: find a contact email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write the verdict and the evidence": {
+      "main": [
+        [
+          {
+            "node": "What did verification decide?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What did verification decide?": {
+      "main": [
+        [
+          {
+            "node": "Is this worth a message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is this worth a message?": {
+      "main": [
+        [
+          {
+            "node": "Tell me",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Stage F: find a contact email": {
+      "main": [
+        [
+          {
+            "node": "Write the verdict and the evidence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

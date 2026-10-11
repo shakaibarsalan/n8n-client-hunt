@@ -1,0 +1,212 @@
+{
+  "name": "CH-06 Client Hunt - Track replies and bounces",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "postProcessAction": "nothing",
+        "format": "resolved",
+        "options": {}
+      },
+      "id": "ch06-trigger-imap",
+      "name": "New mail in the inbox",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [
+        -780,
+        290
+      ],
+      "credentials": {
+        "imap": {
+          "name": "Client Hunt IMAP"
+        }
+      },
+      "notes": "postProcessAction is 'nothing' on purpose: marking mail as read here would hide every reply from the person reading this mailbox on their phone, which is the whole point of having it."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e1",
+              "name": "own_address",
+              "value": "__ENV:OUTREACH_USER__",
+              "type": "string"
+            },
+            {
+              "id": "e2",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch06-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "classify-inbound-mail.js"
+        }
+      },
+      "id": "ch06-classify",
+      "name": "What kind of mail is this?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -340,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "record-inbound-mail.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$json.kind, $json.from_address, $json.message_ids, $json.excerpt, $json.bounce_addresses] }}"
+        }
+      },
+      "id": "ch06-record",
+      "name": "Record it",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "ch06-draft-reply.js"
+        }
+      },
+      "id": "ch06-suggest",
+      "name": "Suggest an answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        290
+      ],
+      "notes": "Fixed answers chosen by simple rules - no AI - so nothing a stranger writes can steer it. The owner sends the reply himself."
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "ch06-telegram",
+      "name": "Tell me about it",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        320,
+        290
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-06 \u2014 Track replies and bounces\n\nWatches the outreach mailbox and ties what arrives back to the message it answers.\n\n**A reply** marks that message `replied` and cancels any later step still waiting, so nobody who has answered gets the follow-up.\n\n**A bounce** marks it `bounced` - the number CH-05's bounce circuit breaker counts - and suppresses the address.\n\nOut-of-office replies, our own BCC copies and unrelated mail are ignored. Only a message we actually sent (`status = 'sent'`) is ever changed, so a mail seen twice changes nothing the second time.\n\nNothing here sends anything, and mail is left unread in the inbox.",
+        "height": 420,
+        "width": 560,
+        "color": 4
+      },
+      "id": "ch06-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1420,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "New mail in the inbox": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "What kind of mail is this?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What kind of mail is this?": {
+      "main": [
+        [
+          {
+            "node": "Record it",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record it": {
+      "main": [
+        [
+          {
+            "node": "Suggest an answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Suggest an answer": {
+      "main": [
+        [
+          {
+            "node": "Tell me about it",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

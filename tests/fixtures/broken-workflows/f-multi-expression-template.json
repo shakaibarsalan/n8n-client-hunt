@@ -1,0 +1,13 @@
+{
+ "name": "f",
+ "nodes": [
+  {
+   "name": "good",
+   "type": "n8n-nodes-base.httpRequest",
+   "parameters": {
+    "url": "={{ $json.base }}/runs/{{ $json.id }}"
+   }
+  }
+ ],
+ "connections": {}
+}

@@ -1,0 +1,25 @@
+{
+ "name": "d",
+ "nodes": [
+  {
+   "name": "bad",
+   "type": "n8n-nodes-base.code",
+   "parameters": {
+    "jsCode": "const c = $('Node That Does Not Exist').first().json;\nreturn [];"
+   }
+  }
+ ],
+ "connections": {
+  "bad": {
+   "main": [
+    [
+     {
+      "node": "Ghost",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ }
+}

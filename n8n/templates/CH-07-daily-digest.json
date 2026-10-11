@@ -1,0 +1,295 @@
+{
+  "name": "CH-07 Client Hunt - Twice-daily digest",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9,21 * * *"
+            }
+          ]
+        }
+      },
+      "id": "ch07-trigger-schedule",
+      "name": "9am and 9pm",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        200
+      ],
+      "notes": "Pakistan time - the workflow's timezone is Asia/Karachi."
+    },
+    {
+      "parameters": {},
+      "id": "ch07-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "g1",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "g2",
+              "name": "whatsapp_per_digest",
+              "value": 8,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch07-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "select-digest.sql"
+        },
+        "options": {}
+      },
+      "id": "ch07-query",
+      "name": "What happened?",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "ch07-digest.js"
+        }
+      },
+      "id": "ch07-write",
+      "name": "Write the digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch07-telegram",
+      "name": "Send the digest",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        100,
+        290
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-07 \u2014 Twice-daily digest\n\nAt 9am and 9pm (Pakistan time): emails sent in the last 12 hours - where and to what kind of business - replies, bounces, what is queued and held, and new and verified leads.\n\nIt replaced a Telegram message per send, per draft batch and per verification run. Only a reply (CH-06) and a stopped sender (CH-05's alarm) still message on their own.\n\nWith each digest, a second message: the next 8 best no-website, no-email leads in the UAE as tap-to-send WhatsApp links with the message written. Sent by a person, from their own phone - never automated.",
+        "height": 320,
+        "width": 520,
+        "color": 4
+      },
+      "id": "ch07-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1380,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "pick-whatsapp-leads.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.whatsapp_per_digest] }}"
+        }
+      },
+      "id": "ch07-wa-pick",
+      "name": "Pick WhatsApp leads",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        500
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      },
+      "notes": "Marks the leads as listed (phone_listed_at), so the next digest brings new ones."
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "ch07-whatsapp-list.js"
+        }
+      },
+      "id": "ch07-wa-write",
+      "name": "Write the WhatsApp list",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "ch07-wa-send",
+      "name": "Send the WhatsApp list",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        100,
+        500
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "9am and 9pm": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "What happened?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Pick WhatsApp leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What happened?": {
+      "main": [
+        [
+          {
+            "node": "Write the digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write the digest": {
+      "main": [
+        [
+          {
+            "node": "Send the digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick WhatsApp leads": {
+      "main": [
+        [
+          {
+            "node": "Write the WhatsApp list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write the WhatsApp list": {
+      "main": [
+        [
+          {
+            "node": "Send the WhatsApp list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

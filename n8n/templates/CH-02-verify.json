@@ -1,0 +1,593 @@
+{
+  "name": "CH-02 Client Hunt - Verify the website gap",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "ch02-trigger-cron",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ch02-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b1",
+              "name": "batch_size",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "b2",
+              "name": "probe_timeout_ms",
+              "value": 5000,
+              "type": "number"
+            },
+            {
+              "id": "b3",
+              "name": "max_probes_per_business",
+              "value": 6,
+              "type": "number"
+            },
+            {
+              "id": "b4",
+              "name": "search_timeout_ms",
+              "value": 10000,
+              "type": "number"
+            },
+            {
+              "id": "b5",
+              "name": "psi_timeout_ms",
+              "value": 45000,
+              "type": "number"
+            },
+            {
+              "id": "b6",
+              "name": "serper_api_key",
+              "value": "__ENV:SERPER_API_KEY__",
+              "type": "string"
+            },
+            {
+              "id": "b7",
+              "name": "pagespeed_api_key",
+              "value": "__ENV:PAGESPEED_API_KEY__",
+              "type": "string"
+            },
+            {
+              "id": "b8",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "b9",
+              "name": "user_agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              "type": "string"
+            },
+            {
+              "id": "q10",
+              "name": "verify_while_queue_below",
+              "value": 90,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch02-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "serper_api_key empty = Stage C is skipped and the classifier gives it no credit, so confidence stays low rather than pretending a search happened. That is the intended degraded mode, not a broken one. Values written as __ENV:<VARNAME>__ are replaced at import time from the environment, so a secret never enters this file or git. A placeholder left unreplaced means the variable was not set, and the node that uses it degrades rather than sending a literal \"__ENV:...__\" anywhere."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT domain, kind, counts_as_social, active FROM platform_domains WHERE active;",
+        "options": {}
+      },
+      "id": "ch02-platforms",
+      "name": "Load platform domains",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "select-pending.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.batch_size, $('Config').first().json.verify_while_queue_below] }}"
+        }
+      },
+      "id": "ch02-pending",
+      "name": "Pick what needs checking",
+      "type": "n8n-nodes-base.postgres",
+      "executeOnce": true,
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        290
+      ],
+      "alwaysOutputData": true,
+      "notes": "The work queue is derived from the data (website_status = 'PENDING'), not held in a queue table. An interrupted run resumes correctly and no business is ever verified twice.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "stage-a-source-claim.js"
+        }
+      },
+      "id": "ch02-stage-a",
+      "name": "Stage A: what did the source actually claim?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "stage-b-crosscheck.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$json.google_place_id, $json.name_norm, $json.phone_e164 || '', $json.geohash7 || '', $json.city || ''] }}"
+        }
+      },
+      "id": "ch02-stage-b",
+      "name": "Stage B: cross-check the open datasets",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        320,
+        290
+      ],
+      "alwaysOutputData": true,
+      "notes": "Free and unlimited. This is the stage that catches the false positives Google Maps produces, and it is the one a naive design leaves out entirely.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "merge-stage-b.js"
+        }
+      },
+      "id": "ch02-merge-b",
+      "name": "Stage B: what do the free datasets say?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": {
+          "$snippet": "stage-c-search.js"
+        }
+      },
+      "id": "ch02-stage-c",
+      "name": "Stage C: search for them",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": {
+          "$snippet": "prove-domain.js"
+        }
+      },
+      "id": "ch02-stage-d",
+      "name": "Stage D: prove the domain",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        980,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": {
+          "$snippet": "quality-check.js"
+        }
+      },
+      "id": "ch02-stage-e",
+      "name": "Stage E: is the site any good?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": {
+          "$snippet": "classify-website.js"
+        }
+      },
+      "id": "ch02-classify",
+      "name": "Classify and score confidence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": {
+          "$snippet": "stage-f-find-email.js"
+        }
+      },
+      "id": "ch02-stage-f",
+      "name": "Stage F: find a contact email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1640,
+        290
+      ],
+      "notes": "Only runs for HAS_WEBSITE / WEAK_WEBSITE leads - a business with a real site is the only place this can look. A confirmed no-website lead correctly gets no email here; that gap is real, not a bug, and is why outreach for those leads should default to phone."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "write-verdict.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$json.id, JSON.stringify($json.website_checks || []), $json.website_status, $json.website_confidence, $json.website_url || '', $json.website_evidence, $json.contact_email || ''] }}"
+        }
+      },
+      "id": "ch02-write",
+      "name": "Write the verdict and the evidence",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1860,
+        290
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "ch02-summary.js"
+        }
+      },
+      "id": "ch02-summary",
+      "name": "What did verification decide?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "q1",
+              "leftValue": "={{ $json.quiet }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch02-worth-saying",
+      "name": "Is this worth a message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2300,
+        290
+      ],
+      "notes": "This runs 48 times a day. Reporting 'nothing to verify' every half hour trains you to scroll past the message, and then you scroll past the one that matters."
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch02-telegram",
+      "name": "Tell me",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2520,
+        290
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-02 \u2014 Verify the website gap\n\n**This is the workflow the project stands or falls on.**\n\nCH-01 produces candidates. A candidate is a business whose Google Maps listing carries no website field. That is *not* the same as a business without a website, and the entire value of the lead list depends on the difference.\n\n### The five stages, cheapest first\n\n| | Stage | Costs | Catches |\n|---|---|---|---|\n| A | What did the listing claim? | free | social-only, Linktree, dead `business.site` |\n| B | Cross-check Overture + Foursquare | **free, unlimited** | the owner has a site, just never added it to Maps |\n| C | Search for them | ~$0.001 | a site under a name we would never guess |\n| D | Guess a domain and **prove** it | free | the rest |\n| E | PageSpeed | free | a site that exists but is unusable |\n| F | Find a contact email | free | only possible for HAS_WEBSITE / WEAK_WEBSITE - a confirmed no-website lead has nowhere for this to look, which is why outreach for those defaults to phone |\n\nEach stage that *completes* adds confidence. Each stage that cannot run leaves it lower. That is the whole mechanism:\n\n> **\"We checked and found nothing\" and \"we could not check\" must never produce the same number.**\n\n### Why there are no IF branches here\n\nEvery stage skips itself when an earlier one already settled the question. The flow stays linear, so there are no Merge nodes and no item-pairing bugs \u2014 the failure mode where one business's answer gets attached to another business.\n\nStage B re-pairs **by place id, not by position**, for the same reason.\n\n### Setup\n\n1. Load the reference data first \u2014 Stage B is worthless against empty tables:\n   ```\n   python tools/load_overture.py --city Oslo --country Norway\n   python tools/load_fsq.py --city Oslo --country Norway\n   ```\n2. Optional: a Serper key in `Config` enables Stage C. Without it the pipeline still works, but confidence caps lower and fewer leads reach CONFIRMED. That is correct behaviour, not a bug.\n3. Optional: a PageSpeed key raises the rate limit. The API works without one.\n\n### Read this number in the report\n\n**\"False positives caught\"** \u2014 businesses whose listing said no website and which turned out to have one. Every one of those is an email that would have opened *\"I noticed you don't have a website\"* to somebody who does. If that number is zero on a batch of 20+, check the reference tables are actually populated for that city.",
+        "height": 900,
+        "width": 640,
+        "color": 5
+      },
+      "id": "ch02-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1520,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Load platform domains",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load platform domains": {
+      "main": [
+        [
+          {
+            "node": "Pick what needs checking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick what needs checking": {
+      "main": [
+        [
+          {
+            "node": "Stage A: what did the source actually claim?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage A: what did the source actually claim?": {
+      "main": [
+        [
+          {
+            "node": "Stage B: cross-check the open datasets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage B: cross-check the open datasets": {
+      "main": [
+        [
+          {
+            "node": "Stage B: what do the free datasets say?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage B: what do the free datasets say?": {
+      "main": [
+        [
+          {
+            "node": "Stage C: search for them",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage C: search for them": {
+      "main": [
+        [
+          {
+            "node": "Stage D: prove the domain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage D: prove the domain": {
+      "main": [
+        [
+          {
+            "node": "Stage E: is the site any good?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage E: is the site any good?": {
+      "main": [
+        [
+          {
+            "node": "Classify and score confidence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify and score confidence": {
+      "main": [
+        [
+          {
+            "node": "Stage F: find a contact email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write the verdict and the evidence": {
+      "main": [
+        [
+          {
+            "node": "What did verification decide?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What did verification decide?": {
+      "main": [
+        [
+          {
+            "node": "Is this worth a message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is this worth a message?": {
+      "main": [
+        [
+          {
+            "node": "Tell me",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Stage F: find a contact email": {
+      "main": [
+        [
+          {
+            "node": "Write the verdict and the evidence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

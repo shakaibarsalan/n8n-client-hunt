@@ -1,0 +1,206 @@
+{
+  "name": "CH-06 Client Hunt - Track replies and bounces",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "postProcessAction": "nothing",
+        "format": "resolved",
+        "options": {}
+      },
+      "id": "ch06-trigger-imap",
+      "name": "New mail in the inbox",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [
+        -780,
+        290
+      ],
+      "credentials": {
+        "imap": {
+          "name": "Client Hunt IMAP"
+        }
+      },
+      "notes": "postProcessAction is 'nothing' on purpose: marking mail as read here would hide every reply from the person reading this mailbox on their phone, which is the whole point of having it."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e1",
+              "name": "own_address",
+              "value": "__ENV:OUTREACH_USER__",
+              "type": "string"
+            },
+            {
+              "id": "e2",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch06-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-06, node: \"What kind of mail is this?\"\n// Mode: Run Once for All Items\n//\n// Sorts what arrived in the outreach mailbox into the only two kinds that\n// must change what this pipeline does next:\n//\n//   reply   a person answered. Their sequence stops - nobody who has replied\n//           should ever get \"I'll make this my last message\" four days later.\n//   bounce  the address is dead. The row is marked bounced, which is what\n//           CH-05's bounce circuit breaker counts, and the address is\n//           suppressed so no future draft can reuse it.\n//\n// Everything else is dropped here rather than guessed at: the BCC copies CH-05\n// sends to our own mailbox, out-of-office auto-replies (they are not an answer,\n// and the follow-up should still go), and anything unrelated. Dropping an\n// unrelated mail costs nothing because record-inbound-mail.sql only ever\n// touches a row it can tie to something we actually sent.\n//\n// Field shapes: the IMAP trigger's \"resolved\" format hands over a parsed mail\n// (from.value[].address, inReplyTo, references, text). The \"simple\" format\n// uses plain strings and textPlain. Both are read, so a format change on the\n// trigger degrades nothing.\n\nconst CFG = $('Config').first().json;\nconst OWN = String(CFG.own_address || '').toLowerCase().trim();\nconst OWN_DOMAIN = OWN.includes('@') ? OWN.split('@')[1] : '';\n\nconst ADDR_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}/gi;\nconst MSGID_RE = /<[^<>\\s]+@[^<>\\s]+>/g;\n\nconst firstAddress = (v) => {\n  if (v && typeof v === 'object') {\n    const list = Array.isArray(v.value) ? v.value : Array.isArray(v) ? v : [];\n    for (const x of list) if (x && x.address) return String(x.address).toLowerCase();\n    return v.text ? firstAddress(String(v.text)) : '';\n  }\n  const m = String(v || '').match(ADDR_RE);\n  return m ? m[0].toLowerCase() : '';\n};\n\n// A header may sit at the top level (resolved format), under headers, or under\n// metadata, and its name may or may not be camel-cased.\nconst field = (m, ...names) => {\n  for (const src of [m, m.headers || {}, m.metadata || {}]) {\n    for (const n of names) {\n      const v = src[n];\n      if (v != null && v !== '') return Array.isArray(v) ? v.join(' ') : String(v);\n    }\n  }\n  return '';\n};\n\nconst ids = (s) => (String(s || '').match(MSGID_RE) || [])\n  .map((x) => x.slice(1, -1).toLowerCase());\n\n// What the person actually wrote, not the quoted message underneath it.\nconst ownWords = (text) => {\n  const out = [];\n  for (const line of String(text || '').replace(/\\r/g, '').split('\\n')) {\n    if (/^\\s*>/.test(line)) break;\n    if (/^\\s*(on .+ wrote:|den .+ skrev|-{2,}\\s*original message|from:\\s|fra:\\s|sent:\\s|sendt:\\s)/i.test(line)) break;\n    out.push(line);\n  }\n  return out.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();\n};\n\nconst BOUNCE_FROM = /mailer-daemon|postmaster|mail delivery/i;\nconst BOUNCE_SUBJECT = /undeliver|delivery status notification|returned mail|failure notice|delivery (has )?failed|could not be delivered|non.?delivery|ikke levert|kunne ikke leveres/i;\nconst AUTO_SUBJECT = /^\\s*(auto(matic)?[ -]?(reply|response|svar)|automatisk svar|autosvar|out of (the )?office|frav(ae|\\u00e6)r|abwesenheit|ferie|vacation)/i;\n\nconst out = [];\n\n// Read from the trigger by name, not from this node's input: the input is the\n// Config node's output, which carries only the config fields.\nfor (const item of $('New mail in the inbox').all()) {\n  const m = item.json || {};\n  const from = firstAddress(m.from);\n  const subject = String(m.subject || '');\n  const text = String(m.text || m.textPlain || '');\n\n  if (!from) continue;\n  // Our own BCC copy of something CH-05 sent - never a reply.\n  if (from === OWN || (OWN_DOMAIN && from.endsWith('@' + OWN_DOMAIN))) continue;\n\n  const isBounce = BOUNCE_FROM.test(from) || BOUNCE_SUBJECT.test(subject);\n  const autoSubmitted = field(m, 'auto-submitted', 'autoSubmitted').toLowerCase();\n  const isAuto = !isBounce && (AUTO_SUBJECT.test(subject) || (autoSubmitted && autoSubmitted !== 'no'));\n  if (isAuto) continue;\n\n  // Which of our messages is this about? In-Reply-To and References name it\n  // directly; a bounce usually quotes the original Message-ID in its body.\n  const messageIds = new Set([\n    ...ids(field(m, 'inReplyTo', 'in-reply-to')),\n    ...ids(field(m, 'references')),\n    ...(isBounce ? ids(text) : []),\n  ]);\n\n  // For a bounce, the dead address is somewhere in the report. Every address\n  // in it is offered; the SQL only matches one we actually sent to.\n  const bounceAddresses = isBounce\n    ? [...new Set((text + ' ' + subject).match(ADDR_RE) || [])]\n      .map((a) => a.toLowerCase())\n      .filter((a) => a !== OWN && !BOUNCE_FROM.test(a) && !(OWN_DOMAIN && a.endsWith('@' + OWN_DOMAIN)))\n    : [];\n\n  out.push({\n    json: {\n      kind: isBounce ? 'bounce' : 'reply',\n      from_address: from,\n      subject,\n      message_ids: [...messageIds].join(' '),\n      bounce_addresses: bounceAddresses.join(' '),\n      excerpt: (isBounce ? text : ownWords(text)).slice(0, 500),\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "ch06-classify",
+      "name": "What kind of mail is this?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -340,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-06: record a reply or a bounce against the message it answers.\n--\n-- Parameters, in order: kind ('reply' | 'bounce'), the sender's address, the\n-- Message-IDs the mail refers to (space-separated, without angle brackets),\n-- an excerpt, and - for a bounce - every address quoted in the report.\n--\n-- A row is matched three ways, any one of which is enough:\n--   * by Message-ID: In-Reply-To / References name the exact message we sent.\n--     This is the one that catches an owner replying from a different\n--     address than the one we wrote to.\n--   * a reply FROM the address we wrote to.\n--   * a bounce whose report quotes the address we wrote to.\n--\n-- Only rows with status 'sent' are ever touched. That makes this safe to run\n-- on any mail at all - a newsletter, a test, the same reply seen twice - since\n-- anything that does not answer a message we actually sent matches nothing,\n-- and a row already marked replied is not 'sent' any more.\n--\n-- A reply or a bounce ends the sequence: a later step still waiting as a\n-- draft, held, or even approved is skipped, so nobody who has answered gets\n-- \"I'll make this my last message\" four days later. A bounced address is\n-- also suppressed, so no future draft can reuse it.\n\nWITH mail AS (\n  SELECT\n    $1::text                                          AS kind,\n    lower(NULLIF($2::text, ''))                       AS from_address,\n    string_to_array(lower(NULLIF($3::text, '')), ' ') AS message_ids,\n    NULLIF($4::text, '')                              AS excerpt,\n    string_to_array(lower(NULLIF($5::text, '')), ' ') AS bounce_addresses\n),\n\nmatched AS (\n  SELECT o.id\n  FROM outreach o, mail m\n  WHERE o.status = 'sent'\n    AND (\n         (o.message_id IS NOT NULL\n            AND lower(trim(both '<>' from o.message_id)) = ANY (m.message_ids))\n      OR (m.kind = 'reply'  AND lower(o.to_email) = m.from_address)\n      OR (m.kind = 'bounce' AND lower(o.to_email) = ANY (m.bounce_addresses))\n    )\n),\n\nmarked AS (\n  UPDATE outreach o SET\n    status        = CASE WHEN m.kind = 'bounce' THEN 'bounced' ELSE 'replied' END,\n    reply_at      = now(),\n    reply_excerpt = left(m.excerpt, 1000)\n  FROM mail m\n  WHERE o.id IN (SELECT id FROM matched)\n  RETURNING o.id, o.business_id, o.to_email, o.status, o.sequence_step, o.reply_excerpt,\n            o.subject, o.template_id\n),\n\nstopped AS (\n  UPDATE outreach o SET\n    status        = 'skipped',\n    review_reason = 'sequence stopped: an earlier message to this business got a '\n                    || (SELECT CASE WHEN kind = 'bounce' THEN 'bounce' ELSE 'reply' END FROM mail)\n  WHERE o.business_id IN (SELECT business_id FROM marked)\n    AND o.status IN ('draft', 'needs_review', 'approved')\n  RETURNING o.id\n),\n\nsuppressed AS (\n  INSERT INTO suppression (kind, value, reason)\n  SELECT 'email', lower(mk.to_email), 'bounced on ' || to_char(now(), 'YYYY-MM-DD')\n  FROM marked mk\n  WHERE mk.status = 'bounced'\n  ON CONFLICT (kind, lower(value)) DO NOTHING\n  RETURNING id\n)\n\nSELECT\n  mk.id AS outreach_id, mk.status, mk.to_email, mk.sequence_step, mk.reply_excerpt,\n  b.name AS business_name, b.city,\n  -- What the suggested answer needs (ch06-draft-reply.js): what kind of\n  -- business, which pitch they answered, and the id /concept takes.\n  mk.business_id, b.category_primary, b.niche, mk.subject,\n  (SELECT t.slug FROM outreach_templates t WHERE t.id = mk.template_id) AS pitch,\n  (SELECT count(*) FROM stopped)    AS later_steps_stopped,\n  (SELECT count(*) FROM suppressed) AS newly_suppressed\nFROM marked mk\nJOIN businesses b ON b.id = mk.business_id\n-- Only replies come back for an instant Telegram message - a person answered,\n-- and that must not wait. Bounces are recorded and suppressed above either\n-- way, and reported in CH-07's twice-daily digest.\nWHERE mk.status = 'replied';\n",
+        "options": {
+          "queryReplacement": "={{ [$json.kind, $json.from_address, $json.message_ids, $json.excerpt, $json.bounce_addresses] }}"
+        }
+      },
+      "id": "ch06-record",
+      "name": "Record it",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-06, node: \"Suggest an answer\"\n// Mode: Run Once for All Items\n//\n// A business answered. The owner replies himself - a reply starts a real\n// conversation about price and timing, and a machine promising the wrong\n// thing loses the client - but he should not have to start from a blank\n// page on his phone. So the Telegram alert carries a suggested answer he can\n// copy, edit and send from the outreach mailbox.\n//\n// Rules, not a language model: the reply text is written by a stranger, and\n// nothing a stranger writes should be able to steer what this produces. The\n// rules only pick which of a few fixed answers to suggest.\n\nconst out = [];\n\n// What the concept would show first, by kind of business.\nconst SHOWS = [\n  [/restaurant|cafe|coffee|bakery|food|grill|kitchen|sweet|mandi|shawarma|pizza|burger/, 'your menu, a few photos and a button to order or book on WhatsApp'],\n  [/salon|beauty|spa|nail|barber|hair|lash|brow|makeup/, 'your services and prices, photos of your work and a button to book an appointment'],\n  [/real_estate|real estate|property|realt/, 'your listings, the areas you cover and a quick way to contact an agent'],\n  [/clinic|dental|dentist|medical|physio|doctor|health/, 'your services, your team and a button to book a visit'],\n  [/car|auto|garage|tyre|tire|repair|polish/, 'your services and prices, your location and a button to book a slot'],\n];\n\nconst has = (t, re) => re.test(t);\n\nfor (const item of $input.all()) {\n  const r = item.json;\n  if (!r || !r.outreach_id) continue;\n\n  const name = String(r.business_name || 'your business').replace(/\\s*[-|,]\\s+[^-|,]*$/, '').trim() || 'your business';\n  const kind = `${r.category_primary || ''} ${r.niche || ''} ${name}`.toLowerCase();\n  const shows = (SHOWS.find(([re]) => re.test(kind)) || [null, 'your services, a few photos and an easy way for customers to reach you'])[1];\n  const text = String(r.reply_excerpt || '').toLowerCase().replace(/\\s+/g, ' ').trim();\n  const pitch = String(r.pitch || 'default');\n  const offer = pitch === 'weak_website' ? 'the short list of what I would improve on your website' : `the website concept for ${name}`;\n\n  // Order matters: \"no problem, please send it\" is a yes, not a no.\n  let intent = 'question';\n  if (has(text, /\\b(not interested|unsubscribe|remove me|don'?t (contact|email|message)|do not (contact|email)|stop (emailing|sending|contacting))\\b/)\n      || /^(no|nope|no thanks?( you)?|not now|not needed|stop)[.!\\s]*$/.test(text)\n      || /^(\u0644\u0627|\u0644\u0627 \u0634\u0643\u0631\u0627)/.test(text)) {\n    intent = 'no';\n  } else if (has(text, /\\b(we (already )?have (a |our own )?(website|site)|already have (a )?(website|site)|our website is)\\b/)) {\n    intent = 'has_site';\n  } else if (has(text, /\\b(price|prices|pricing|cost|costs|how much|charges?|rates?|budget|fees?|quote|quotation|aed|dhs?|dirhams?|nok|kr)\\b|\u0643\u0645|\u0627\u0644\u0633\u0639\u0631|\u0633\u0639\u0631/)) {\n    intent = 'price';\n  } else if (has(text, /\\b(yes|yeah|yep|sure|ok|okay|please|send|share|show me|interested|go ahead|why not|of course|definitely|let'?s see|would love|sounds good)\\b|\u0646\u0639\u0645|\u0623\u0631\u0633\u0644|\u0627\u0631\u0633\u0644|\u062a\u0645\u0627\u0645/)) {\n    intent = 'yes';\n  }\n\n  const SIGN = '\\n\\nKind regards,\\nAlex\\nExample Web Studio';\n  const DRAFT = {\n    yes: `Hi,\\n\\nThanks for getting back to me! I'll put together ${offer} and send it over in the next day or two.\\n\\n` +\n         `So it's closer to what you'd want: is there anything you'd like it to show first - for example ${shows}?` + SIGN,\n    price: `Hi,\\n\\nThanks for your reply! It depends on what you need - a simple one-page website starts from [your starting price], ` +\n           `and more pages or online booking add to that.\\n\\nThe easiest way is for me to send ${offer} first, with a clear quote ` +\n           `alongside it, so you know exactly what you would get. Would that work for you?` + SIGN,\n    has_site: `Hi,\\n\\nThanks for letting me know, and sorry for the mix-up - I couldn't find it when I looked. ` +\n              `If you ever want a second opinion on it, or help making it faster on a phone, just reply here.\\n\\nAll the best with ${name}.` + SIGN,\n    no: `Hi,\\n\\nThanks for letting me know - I won't contact you again. All the best with ${name}.` + SIGN,\n    question: `Hi,\\n\\nThanks for getting back to me! [answer their question here]\\n\\n` +\n              `If it helps, I can also send over ${offer} so you can see what I have in mind - shall I?` + SIGN,\n  }[intent];\n\n  const LABEL = {\n    yes: 'Interested - send the concept',\n    price: 'Asking about price - fill in your price',\n    has_site: 'Says they already have a website',\n    no: 'Not interested - nothing more will be sent to them; answering is optional',\n    question: 'A question - answer it in the draft',\n  }[intent];\n\n  const lines = [];\n  lines.push(`REPLY - ${r.business_name} (${r.city || '?'}) <${r.to_email}>` +\n    (Number(r.later_steps_stopped) > 0 ? ' - follow-up cancelled' : ''));\n  lines.push('');\n  lines.push(String(r.reply_excerpt || '(no text)').trim());\n  lines.push('');\n  lines.push(`Looks like: ${LABEL}`);\n  lines.push('');\n  lines.push('Suggested answer - reply in the same thread, from the outreach mailbox:');\n  lines.push('');\n  lines.push(DRAFT);\n  if (intent === 'yes' || intent === 'price' || intent === 'question') {\n    lines.push('');\n    lines.push(`Website concept for them: /concept ${r.business_id}`);\n  }\n\n  out.push({ json: { ...r, intent, message: lines.join('\\n') } });\n}\n\nreturn out;\n"
+      },
+      "id": "ch06-suggest",
+      "name": "Suggest an answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        290
+      ],
+      "notes": "Fixed answers chosen by simple rules - no AI - so nothing a stranger writes can steer it. The owner sends the reply himself."
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "ch06-telegram",
+      "name": "Tell me about it",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        320,
+        290
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-06 \u2014 Track replies and bounces\n\nWatches the outreach mailbox and ties what arrives back to the message it answers.\n\n**A reply** marks that message `replied` and cancels any later step still waiting, so nobody who has answered gets the follow-up.\n\n**A bounce** marks it `bounced` - the number CH-05's bounce circuit breaker counts - and suppresses the address.\n\nOut-of-office replies, our own BCC copies and unrelated mail are ignored. Only a message we actually sent (`status = 'sent'`) is ever changed, so a mail seen twice changes nothing the second time.\n\nNothing here sends anything, and mail is left unread in the inbox.",
+        "height": 420,
+        "width": 560,
+        "color": 4
+      },
+      "id": "ch06-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1420,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "New mail in the inbox": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "What kind of mail is this?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What kind of mail is this?": {
+      "main": [
+        [
+          {
+            "node": "Record it",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record it": {
+      "main": [
+        [
+          {
+            "node": "Suggest an answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Suggest an answer": {
+      "main": [
+        [
+          {
+            "node": "Tell me about it",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

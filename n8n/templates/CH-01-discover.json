@@ -1,0 +1,710 @@
+{
+  "name": "CH-01 Client Hunt - Discover businesses",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/30 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "ch01-trigger-cron",
+      "name": "Every 30 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ch01-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "apify_actor_id",
+              "value": "compass~google-maps-extractor",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "apify_base",
+              "value": "https://api.apify.com/v2",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "poll_seconds",
+              "value": 20,
+              "type": "number"
+            },
+            {
+              "id": "a4",
+              "name": "max_polls",
+              "value": 40,
+              "type": "number"
+            },
+            {
+              "id": "a5",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "default_min_lead_score",
+              "value": 60,
+              "type": "number"
+            },
+            {
+              "id": "a7",
+              "name": "apify_cost_per_place",
+              "value": 0.007,
+              "type": "number"
+            },
+            {
+              "id": "a8",
+              "name": "apify_reserve_usd",
+              "value": 0.3,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch01-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "Every run-level knob lives here. Niche and location do NOT - they come from the search_targets table. This node exists because the instance has no Variables licence and $env is blocked below Enterprise. Values written as __ENV:<VARNAME>__ are replaced at import time from the environment, so a secret never enters this file or git. A placeholder left unreplaced means the variable was not set, and the node that uses it degrades rather than sending a literal \"__ENV:...__\" anywhere."
+    },
+    {
+      "parameters": {
+        "url": "https://api.apify.com/v2/users/me/limits",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "ch01-credit",
+      "name": "How much credit is left?",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -450,
+        150
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apify token"
+        }
+      },
+      "notes": "Asks Apify what is actually left rather than trusting a number we wrote down. This endpoint is free and does not consume credit. It exists because our own place counter can only ever under-estimate: Apify also bills for actor starts and for each filter applied per place, so a cap expressed in places drifts below the real spend."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "select-due-targets.sql"
+        },
+        "options": {}
+      },
+      "id": "ch01-select-target",
+      "name": "Pick one target",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "check-the-budget.js"
+        }
+      },
+      "id": "ch01-budget",
+      "name": "BRAKE: can we afford this run?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.go }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch01-gate",
+      "name": "Cleared to spend?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        100,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.apify_base }}/acts/{{ $('Config').first().json.apify_actor_id }}/runs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.apify_input) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "ch01-start-run",
+      "name": "Start the scrape",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        200
+      ],
+      "notes": "Plain HTTP rather than the Apify community node: that node is not installed on this instance, and an HTTP call has no community-package dependency to break on an n8n upgrade.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apify token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": "={{ $('Config').first().json.poll_seconds }}",
+        "unit": "seconds"
+      },
+      "id": "ch01-wait",
+      "name": "Wait 20s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        540,
+        200
+      ],
+      "webhookId": "ch01-wait-webhook"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Config').first().json.apify_base }}/actor-runs/{{ $('Start the scrape').first().json.data.id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "ch01-poll",
+      "name": "Is it finished?",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apify token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ ['READY','RUNNING'].includes($json.data.status) && $runIndex < $('Config').first().json.max_polls }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch01-still-running",
+      "name": "Still running?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        980,
+        200
+      ],
+      "notes": "Polling, not run-sync-get-dataset-items: that endpoint gives up after 5 minutes and a Maps scrape regularly runs longer. The $runIndex cap is what stops this looping forever when a run hangs - roughly 13 minutes at 20s per poll."
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Config').first().json.apify_base }}/datasets/{{ $('Is it finished?').first().json.data.defaultDatasetId }}/items",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "clean",
+              "value": "true"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "ch01-dataset",
+      "name": "Collect the results",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apify token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "normalise-business.js"
+        }
+      },
+      "id": "ch01-normalise",
+      "name": "Normalise the business",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "upsert-business.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$json.google_place_id, $json.search_target_id, $json.niche, $json.name, $json.name_norm, $json.category_primary, $json.categories, $json.address, $json.street, $json.city, $json.state, $json.country, $json.country_code, $json.postal_code, $json.lat, $json.lon, $json.geohash7, $json.phone_raw, $json.phone_e164, $json.email, $json.listing_url, JSON.stringify($json.social_profiles), $json.rating, $json.review_count, $json.price_level, $json.permanently_closed, $json.temporarily_closed, JSON.stringify($json.raw), $json.source] }}"
+        }
+      },
+      "id": "ch01-store",
+      "name": "Store it, once",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1640,
+        300
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "ch01-summary.js"
+        }
+      },
+      "id": "ch01-summary",
+      "name": "What did we find?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE search_targets SET last_run_at = now(), last_run_found = $2 WHERE id = $1;\nUPDATE app_state SET value = jsonb_set(jsonb_set(CASE WHEN value ->> 'month' = to_char(now(),'YYYY-MM') THEN value ELSE jsonb_set(jsonb_set(value, '{month}', to_jsonb(to_char(now(),'YYYY-MM'))), '{places_scraped}', '0') END, '{places_scraped}', to_jsonb(COALESCE((value ->> 'places_scraped')::int,0) + $2)), '{runs_started}', to_jsonb(COALESCE((value ->> 'runs_started')::int,0) + 1)) WHERE key = 'apify_spend';",
+        "options": {
+          "queryReplacement": "={{ [$json.target_id, $json.total] }}"
+        }
+      },
+      "id": "ch01-mark-run",
+      "name": "Record the run and the spend",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2080,
+        300
+      ],
+      "notes": "The spend counter resets itself when the month rolls over, in the same statement that increments it. A counter that needs a separate monthly reset job is a counter that will one day be a month stale and silently block every run.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch01-telegram",
+      "name": "Tell me",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2300,
+        300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "=CH-01 did not run: {{ $json.reason }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch01-telegram-halt",
+      "name": "Say why we stopped",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        320,
+        420
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-01 \u2014 Discover businesses\n\nAsks Apify's Google Maps extractor for businesses **without a website** in one market, and stores what comes back.\n\n### The niche is not in this workflow\n\nNothing here names a niche or a city. `Pick one target` reads the next due row from the `search_targets` table. To hunt a new market:\n\n```sql\nINSERT INTO search_targets (niche, niche_query, country, city, cctlds, enabled)\nVALUES ('Dental Clinics', 'dental clinic', 'United Arab Emirates', 'Dubai', ARRAY['.ae','.com'], true);\n```\n\nTo stop hunting one, set `enabled = false`. No node is edited either way.\n\n### Setup\n\n1. Credential **HTTP Header Auth** named `Apify token` \u2014 name `Authorization`, value `Bearer <apify token>`.\n2. Credential **Postgres** pointing at the lead database.\n3. Credential **Telegram**, and put your chat id in `Config`.\n4. Run `db/001`, `db/002`, `db/003` first \u2014 this workflow reads three tables that those create.\n\n### What it deliberately does NOT do\n\n- It never sets `website_status`. That is CH-02's job, and the upsert explicitly preserves an existing verdict. If this workflow could reset a verified row to PENDING, every daily run would re-verify and re-spend on the entire database.\n- It processes **one target per run**. A bad target cannot consume the month's credit before anyone notices.\n\n### The brake\n\n`BRAKE: can we afford this run?` refuses to start once the monthly place cap in `app_state.apify_spend` is reached. The free plan is $5/month with no rollover, and Apify blocks runs at zero rather than warning first. The brake is in before the first live request, not after the first surprise bill.",
+        "height": 760,
+        "width": 620,
+        "color": 4
+      },
+      "id": "ch01-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1480,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "q1",
+              "leftValue": "={{ $json.quiet !== true && new Date().getUTCMinutes() < 30 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch01-worth-a-message",
+      "name": "Worth a message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        100,
+        420
+      ],
+      "notes": "A routine stop (no budget left this month) is reported in the digest only. A real fault messages at most once an hour - CH-01 runs every 30 minutes."
+    }
+  ],
+  "connections": {
+    "Every 30 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "How much credit is left?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick one target": {
+      "main": [
+        [
+          {
+            "node": "BRAKE: can we afford this run?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BRAKE: can we afford this run?": {
+      "main": [
+        [
+          {
+            "node": "Cleared to spend?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleared to spend?": {
+      "main": [
+        [
+          {
+            "node": "Start the scrape",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Worth a message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start the scrape": {
+      "main": [
+        [
+          {
+            "node": "Wait 20s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 20s": {
+      "main": [
+        [
+          {
+            "node": "Is it finished?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is it finished?": {
+      "main": [
+        [
+          {
+            "node": "Still running?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still running?": {
+      "main": [
+        [
+          {
+            "node": "Wait 20s",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Collect the results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect the results": {
+      "main": [
+        [
+          {
+            "node": "Normalise the business",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise the business": {
+      "main": [
+        [
+          {
+            "node": "Store it, once",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store it, once": {
+      "main": [
+        [
+          {
+            "node": "What did we find?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What did we find?": {
+      "main": [
+        [
+          {
+            "node": "Record the run and the spend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record the run and the spend": {
+      "main": [
+        [
+          {
+            "node": "Tell me",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "How much credit is left?": {
+      "main": [
+        [
+          {
+            "node": "Pick one target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Worth a message?": {
+      "main": [
+        [
+          {
+            "node": "Say why we stopped",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  }
+}

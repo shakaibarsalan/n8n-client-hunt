@@ -1,0 +1,372 @@
+{
+  "name": "CH-03 Client Hunt - Score leads",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "ch03s-trigger-cron",
+      "name": "Every 10 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ch03s-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "s1",
+              "name": "batch_size",
+              "value": 100,
+              "type": "number"
+            },
+            {
+              "id": "s2",
+              "name": "scoring_version",
+              "value": "v1-2026-09",
+              "type": "string"
+            },
+            {
+              "id": "s3",
+              "name": "default_min_lead_score",
+              "value": 60,
+              "type": "number"
+            },
+            {
+              "id": "s4",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch03s-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "scoring_version MUST match the SCORING_VERSION constant at the top of score-lead.js exactly - tests/score-lead-version.test.js pins the two together so a mismatch fails CI rather than silently re-scoring nothing, forever, because every business already has a row under a version this Config no longer names."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT kind, key, weight FROM scoring_weights;",
+        "options": {}
+      },
+      "id": "ch03s-weights",
+      "name": "Load scoring weights",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-03: which verified businesses have not been scored under this model\n-- version yet?\n--\n-- \"Not yet scored under THIS version\" rather than \"never scored at all\" -\n-- bumping SCORING_VERSION in score-lead.js after a calibration is meant to\n-- re-score everything under the new model, and lead_scores is unique on\n-- (business_id, scoring_version) precisely so the old and new scores can\n-- coexist and be compared. $1 is that version string; tests/score-lead-\n-- version.test.js pins it to the literal inside score-lead.js so the two\n-- cannot silently drift apart.\n--\n-- Two facts score-lead.js needs are not columns on `businesses` - they only\n-- ever existed as in-memory values partway through CH-02's own pipeline. Both\n-- are derived here from `website_checks`, the append-only evidence trail,\n-- rather than given new columns purely to carry transient state:\n--\n--   probe_was_unreachable  - did Stage D's domain probe fail to complete?\n--                            Absence of a website was never demonstrated,\n--                            so this forces a review regardless of score.\n--   psi_performance        - the last PageSpeed mobile score Stage E found,\n--                            or NULL if it was never measured (a shared free\n--                            quota, so this is common and not an error).\n\nSELECT\n  b.id, b.website_status, b.website_confidence, b.permanently_closed,\n  b.phone_e164, b.address, b.review_count, b.rating, b.city, b.social_profiles,\n  b.niche, b.country, b.email,\n  COALESCE(t.min_lead_score, 60) AS min_lead_score,\n\n  -- Stage D probes several candidate domains per business (up to 8), and\n  -- ANY SINGLE ONE of those guesses can time out - a bogus domain guess\n  -- failing to connect happens constantly and says nothing about the\n  -- others. The hold belongs only when NONE of the attempts ever reached a\n  -- conclusive outcome: no page was ever actually fetched and judged\n  -- ('found'/'rejected'), and no domain was cleanly absent ('not_found').\n  --\n  -- The first version flagged this whenever ANY attempt was 'unreachable',\n  -- which held EVERY business with a wide candidate list almost by\n  -- accident - measured on real data, a one-person salon (\"Salon E\" in\n  -- docs/POC-RESULTS.md) was fully classified NO_WEBSITE_CONFIRMED at 1.00 confidence\n  -- (six domains cleanly rejected or not-found) and still got flagged,\n  -- because one of eight guessed domains happened to time out. 68 of 90\n  -- real businesses were wrongly held by this before it was measured\n  -- against actual probe evidence and fixed.\n  (\n    EXISTS (SELECT 1 FROM website_checks wc\n             WHERE wc.business_id = b.id AND wc.stage = 'probe')\n    AND NOT EXISTS (SELECT 1 FROM website_checks wc\n             WHERE wc.business_id = b.id AND wc.stage = 'probe'\n               AND wc.outcome IN ('found', 'rejected', 'not_found'))\n  ) AS probe_was_unreachable,\n\n  (\n    SELECT (wc.evidence ->> 'performance')::numeric\n    FROM website_checks wc\n    WHERE wc.business_id = b.id\n      -- Stage F (email discovery) also writes stage='quality' rows, tagged\n      -- with a different method - 'email.<url>' rather than\n      -- 'pagespeed.mobile' - so this has to match on method, not just stage,\n      -- or an email-lookup row could be mistaken for a performance score.\n      AND wc.stage = 'quality' AND wc.method = 'pagespeed.mobile'\n      AND wc.outcome = 'found' AND wc.evidence ? 'performance'\n    ORDER BY wc.checked_at DESC LIMIT 1\n  ) AS psi_performance\n\nFROM businesses b\nLEFT JOIN search_targets t ON t.id = b.search_target_id\nWHERE b.website_status <> 'PENDING'\n  AND NOT EXISTS (\n    SELECT 1 FROM lead_scores s\n    WHERE s.business_id = b.id AND s.scoring_version = $1)\nORDER BY b.website_confidence DESC NULLS LAST, b.first_seen_at ASC\nLIMIT $2;\n",
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.scoring_version, $('Config').first().json.batch_size] }}"
+        }
+      },
+      "id": "ch03s-pending",
+      "name": "Pick what needs scoring",
+      "type": "n8n-nodes-base.postgres",
+      "executeOnce": true,
+      "typeVersion": 2.5,
+      "position": [
+        -120,
+        290
+      ],
+      "alwaysOutputData": true,
+      "notes": "Not yet scored under the CURRENT scoring_version - bumping the version after a calibration re-scores everything under the new model, and lead_scores keeps both versions rather than overwriting.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-03, node: \"Score the lead\"\n// Mode: Run Once for All Items\n//\n// Wired up for the first time here, as its own scheduled workflow reading\n// businesses back OUT of Postgres - not, as originally sketched, inline\n// inside CH-02's own pipeline. That move cost two fields their natural\n// shape: `probe_result` and `psi` existed only as in-memory values on a CH-02\n// item mid-run, and neither is a column on `businesses`. Rather than add\n// columns purely to carry transient pipeline state, the SELECT that feeds\n// this node derives the same two facts from `website_checks` - the append-\n// only evidence trail that already exists for exactly this purpose - and\n// passes them in under new, flatter names: `probe_was_unreachable` (boolean)\n// and `psi_performance` (number or null). See select-pending-scoring.sql.\n//\n// A transparent, deterministic score. Every point is traceable to a field,\n// and components[] is stored alongside the total so that a lead's score can\n// be explained later without re-deriving it.\n//\n//   Lead Score (0-100)\n//     = Website Opportunity  (0-40)   is there a gap, and how sure are we\n//     + Business Viability   (0-25)   are they actually trading\n//     + Contactability       (0-20)   can we reach them at all\n//     + Spend Potential      (0-15)   are they likely to pay\n//\n// THESE WEIGHTS ARE A HYPOTHESIS, NOT A FINDING.\n//\n// They encode three beliefs: that a verified gap matters most, that review\n// count is the only public proxy for \"this business has customers and money\",\n// and that an unreachable lead is worthless however good it looks. None of\n// that is measured yet. After ~50 outreach attempts, refit against actual\n// reply rate and bump SCORING_VERSION - lead_scores is unique on\n// (business_id, scoring_version) precisely so both can coexist and be\n// compared.\n//\n// The reason for versioning rather than overwriting: the score that decided\n// an outreach decision must still be readable after the model changes, or the\n// calibration has nothing to calibrate against.\n\nconst SCORING_VERSION = 'v1-2026-09';\n\nconst CFG = $('Config').first().json;\nconst weights = $('Load scoring weights').all().map((i) => i.json);\n\nconst weightFor = (kind, key) => {\n  const k = String(key || '').toLowerCase();\n  const w = weights.find((x) => x.kind === kind && String(x.key).toLowerCase() === k);\n  return w ? Number(w.weight) : 1.0;\n};\n\n// --- Website Opportunity (0-40) --------------------------------------------\n// Scaled by confidence, so a 0.62-confidence NO_WEBSITE_LIKELY cannot score\n// the same as a 0.95-confidence confirmed one. This is what stops a thin-data\n// region quietly producing high-scoring leads.\nconst opportunity = (b) => {\n  const c = Number(b.website_confidence || 0);\n  switch (b.website_status) {\n    case 'NO_WEBSITE_CONFIRMED': return { pts: Math.round(40 * c), why: `confirmed gap (confidence ${c})` };\n    case 'NO_WEBSITE_LIKELY':    return { pts: Math.round(30 * c), why: `likely gap (confidence ${c})` };\n    case 'WEAK_WEBSITE': {\n      // A weak site is often the better sale: they already believe a website\n      // matters, so the argument is about quality, not about whether to have\n      // one at all. Scored just under a confirmed gap, never above it.\n      //\n      // psi_performance is null whenever PageSpeed never actually measured\n      // the site (CH-02's Stage E is best-effort against a shared free\n      // quota) - defaulting to 100 in that case is deliberate: an unmeasured\n      // site should not look artificially bad next to one that was measured\n      // and genuinely is slow.\n      const perf = b.psi_performance == null ? 100 : Number(b.psi_performance);\n      const pts = perf < 25 ? 30 : perf < 50 ? 24 : 18;\n      return { pts, why: `weak site (mobile performance ${Math.round(perf)})` };\n    }\n    case 'WEBSITE_UNCERTAIN':    return { pts: 8, why: 'uncertain - needs a human look' };\n    default:                     return { pts: 0, why: 'has a working website' };\n  }\n};\n\n// --- Business Viability (0-25) ---------------------------------------------\nconst viability = (b) => {\n  const reviews = Number(b.review_count || 0);\n  const rating = Number(b.rating || 0);\n  let pts = 0;\n  const bits = [];\n\n  // A baseline for being demonstrably a real, operating business.\n  //\n  // The first version scored 0 here whenever a business had no reviews, which\n  // treated \"no reviews\" as \"might not be trading\". It is not: a listing with\n  // a phone number, a street address and a category is a business that exists\n  // and is open. Reviews say how BUSY it is, not whether it is real.\n  //\n  // Measured on the first 30: half had no reviews at all, and hand-checking\n  // found them to be perfectly ordinary one-person salons. Scoring them as\n  // though their existence were in doubt pushed verified no-website leads -\n  // exactly what this project is for - below the qualification line.\n  if (!b.permanently_closed && b.phone_e164 && b.address) {\n    pts += 6;\n    bits.push('operating (phone + address)');\n  }\n\n  // Log-scaled: a salon with 400 reviews is not eight times the prospect of\n  // one with 50. It is a bigger business, which also makes it likelier to\n  // already have an agency. The curve saturates around 100 reviews.\n  if (reviews > 0) {\n    pts += Math.min(12, Math.round((Math.log10(reviews + 1) / 2) * 12));\n    bits.push(`${reviews} reviews`);\n  } else {\n    bits.push('no reviews yet');\n  }\n\n  if (rating >= 4.0) { pts += 4; bits.push(`rated ${rating}`); }\n  if (rating >= 4.5) { pts += 3; bits.push('highly rated'); }\n  // A business with reviews but no rating is odd enough to mention.\n  if (rating === 0 && reviews > 0) bits.push('no rating despite reviews');\n\n  return { pts: Math.min(25, pts), why: bits.join(', ') };\n};\n\n// --- Contactability (0-20) --------------------------------------------------\n// A lead we cannot reach is not a lead, whatever else is true about it.\nconst contactability = (b) => {\n  let pts = 0;\n  const bits = [];\n  if (b.phone_e164) { pts += 8; bits.push('phone'); }\n  if (b.email) { pts += 6; bits.push('email'); }\n  if (b.address && b.city) { pts += 3; bits.push('address'); }\n  if (b.social_profiles && Object.keys(b.social_profiles).length) { pts += 3; bits.push('social'); }\n  return { pts: Math.min(20, pts), why: bits.length ? bits.join(' + ') : 'no contact route at all' };\n};\n\n// --- Spend Potential (0-15) -------------------------------------------------\nconst spend = (b) => {\n  const nw = weightFor('niche', b.niche);\n  const cw = weightFor('country', b.country);\n  const pts = Math.round(15 * nw * cw);\n  return { pts: Math.min(15, pts), why: `${b.niche} x ${b.country} (${nw} x ${cw})` };\n};\n\n// ---------------------------------------------------------------------------\n\n// \"Pick what needs scoring\" has alwaysOutputData set - deliberately, so this\n// node still runs and can emit the empty-batch sentinel below when there is\n// nothing to score, rather than being skipped outright with no output at\n// all. But that means a zero-row query result arrives here as ONE blank\n// item ({}), not zero items - $input.all() is never actually empty. The\n// loop below ran once over that blank object anyway, scored it from all-\n// undefined fields, and pushed a real-looking row with business_id:\n// undefined into `out` - so the `if (!out.length)` sentinel check below\n// never fired, and \"Store the score\" crashed on a NOT NULL violation\n// instead. Found running for real: it failed identically on every 30-\n// minute schedule tick once the visible backlog had actually been cleared,\n// which no test in this project ever exercised - every test and every\n// manual run this session fed real business rows in, never n8n's own\n// \"nothing to do\" shape.\nconst rows = $input.all().filter((item) => item.json && item.json.id != null);\n\nconst out = [];\n\nfor (const item of rows) {\n  const b = item.json;\n\n  const o = opportunity(b);\n  const v = viability(b);\n  const c = contactability(b);\n  const s = spend(b);\n  const total = Math.max(0, Math.min(100, o.pts + v.pts + c.pts + s.pts));\n\n  const minScore = Number(b.min_lead_score || CFG.default_min_lead_score || 60);\n\n  // --- Two holds that config cannot switch off ----------------------------\n  //\n  // Mirrors needs_human_review() in the job-hunt scoring module: the cases\n  // where automation should not be trusted are exactly the cases where a\n  // setting must not be able to wave it through.\n  //\n  // Both of these exist to prevent one specific email - \"I noticed you don't\n  // have a website\" - reaching a business that has one.\n  let needsReview = false;\n  let reviewReason = null;\n\n  if (Number(b.website_confidence || 0) < 0.6 &&\n      String(b.website_status || '').startsWith('NO_WEBSITE')) {\n    needsReview = true;\n    reviewReason = `confidence ${b.website_confidence} is below 0.6 - the gap is not established`;\n  }\n  if (b.probe_was_unreachable) {\n    needsReview = true;\n    reviewReason = 'a website probe could not complete, so absence was never demonstrated';\n  }\n  if (b.website_status === 'WEBSITE_UNCERTAIN') {\n    needsReview = true;\n    reviewReason = reviewReason || 'conflicting signals about whether a website exists';\n  }\n  // Viability + contactability + spend alone can reach 60 (25+20+15) with\n  // zero contribution from the opportunity component - a well-reviewed,\n  // easily-reached, high-spend business that simply has a working website.\n  // That is exactly the email this project must never send, so a lead with\n  // no opportunity points at all is never \"qualified\" regardless of total.\n  if (o.pts === 0) {\n    needsReview = true;\n    reviewReason = reviewReason || `website_status is ${b.website_status} - no gap to pitch, whatever the rest of the score says`;\n  }\n\n  out.push({\n    json: {\n      business_id: b.id,\n      scoring_version: SCORING_VERSION,\n      total,\n      qualified: total >= minScore && !needsReview,\n      needs_review: needsReview,\n      review_reason: reviewReason,\n      components: {\n        website_opportunity: { points: o.pts, max: 40, why: o.why },\n        business_viability:  { points: v.pts, max: 25, why: v.why },\n        contactability:      { points: c.pts, max: 20, why: c.why },\n        spend_potential:     { points: s.pts, max: 15, why: s.why },\n        threshold: minScore,\n      },\n    },\n  });\n}\n\nif (!out.length) {\n  // Idling correctly is not a failure, and a report that calls it one gets\n  // ignored as fast as one that hides a real fault.\n  return [{ json: { _nothing_to_score: true, scoring_version: SCORING_VERSION } }];\n}\n\nreturn out;\n"
+      },
+      "id": "ch03s-score",
+      "name": "Score the lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        100,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-03, node: \"Drop the empty-batch sentinel\"\n// Mode: Run Once for All Items\n//\n// score-lead.js emits a single sentinel item, `{_nothing_to_score: true}`,\n// when it received nothing to score - the same \"idling correctly is not a\n// failure\" shape used throughout this project. Feeding that sentinel\n// straight into the Postgres insert node would try to INSERT a row with\n// business_id = undefined and fail the whole execution on what is actually\n// the quiet, normal case.\n//\n// Filtering it out here, rather than branching on it with an IF node, keeps\n// the chain linear: with zero items reaching it, \"Store the score\" simply\n// does not run, and the summary node downstream already knows how to report\n// nothing to do without needing this workflow to branch.\n\nconst items = $input.all().filter((i) => !i.json._nothing_to_score);\nreturn items;\n"
+      },
+      "id": "ch03s-drop-sentinel",
+      "name": "Drop the empty-batch sentinel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-03: store the score.\n--\n-- ON CONFLICT DO UPDATE here, unlike CH-04's insert-outreach-draft.sql which\n-- deliberately does DO NOTHING. The difference is deliberate, not an\n-- inconsistency: an outreach draft can carry a human's own edits and\n-- decisions (status, review notes) that a re-run must never clobber, but a\n-- score has no human-owned state at all - qualified and needs_review are\n-- fully derived from the model, so refreshing it on every run is correct.\n-- Re-scoring the same (business_id, scoring_version) pair happens when a\n-- business is re-verified (rating changed, a review came in) without the\n-- scoring model itself changing.\n\nINSERT INTO lead_scores\n  (business_id, scoring_version, total, qualified, needs_review, review_reason, components)\nVALUES\n  ($1, $2, $3, $4, $5, $6, $7::jsonb)\nON CONFLICT (business_id, scoring_version) DO UPDATE SET\n  total         = EXCLUDED.total,\n  qualified     = EXCLUDED.qualified,\n  needs_review  = EXCLUDED.needs_review,\n  review_reason = EXCLUDED.review_reason,\n  components    = EXCLUDED.components,\n  scored_at     = now()\nRETURNING id, business_id, total, qualified;\n",
+        "options": {
+          "queryReplacement": "={{ [$json.business_id, $json.scoring_version, $json.total, $json.qualified, $json.needs_review, $json.review_reason || '', JSON.stringify($json.components)] }}"
+        }
+      },
+      "id": "ch03s-store",
+      "name": "Store the score",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        540,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-03, node: \"What did scoring produce?\"\n// Mode: Run Once for All Items\n\nconst rows = $('Store the score').all().map((i) => i.json).filter((r) => r && r.id);\n\nif (!rows.length) {\n  // Nothing to score is the normal state once every verified business\n  // already has a current score. Not a fault.\n  return [{ json: { quiet: true, message: 'CH-03: nothing waiting to be scored.' } }];\n}\n\nconst qualified = rows.filter((r) => r.qualified).length;\n\nconst lines = [\n  `CH-03 scored ${rows.length}`,\n  `  ${qualified} qualified (ready for CH-04 to draft)`,\n];\n\nconst top = rows.slice().sort((a, b) => b.total - a.total).slice(0, 3);\nif (top.length) {\n  lines.push('');\n  lines.push('Top of this batch:');\n  for (const r of top) lines.push(`  ${r.total}  business #${r.business_id}`);\n}\n\n// Quiet since 5 Oct 2026, at the owner's request: a message per run (every\n// 10 minutes) buried the ones that matter. CH-07's twice-daily digest\n// reports what this produced.\nreturn [{ json: { quiet: true, total: rows.length, qualified, message: lines.join('\\n') } }];\n"
+      },
+      "id": "ch03s-summary",
+      "name": "What did scoring produce?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "sw1",
+              "leftValue": "={{ $json.quiet }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch03s-worth-saying",
+      "name": "Is this worth a message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        980,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch03s-telegram",
+      "name": "Tell me",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1200,
+        290
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-03 \u2014 Score leads\n\nTurns a CH-02 verdict into a number. Deterministic, no external calls, so this is free and safe to run often.\n\n```\nLead Score (0-100) = Website Opportunity (0-40)\n                    + Business Viability  (0-25)\n                    + Contactability      (0-20)\n                    + Spend Potential     (0-15)\n```\n\nThe full reasoning for each component is in `n8n/snippets/score-lead.js` \u2014 it is a starting hypothesis, not a finding, and says so in its own comments.\n\n### Two fields that do not live on `businesses`\n\n`probe_was_unreachable` and `psi_performance` only ever existed as in-memory values partway through CH-02's pipeline. `select-pending-scoring.sql` derives both from `website_checks` \u2014 the append-only evidence trail \u2014 rather than giving them their own columns purely to carry transient state.\n\n### Versioning\n\n`scoring_version` in `Config` must match the `SCORING_VERSION` constant in `score-lead.js` exactly. A mismatch does not error \u2014 it just means nothing gets scored, silently, forever, because every business already has a row under the version nobody is asking for any more. `tests/score-lead-version.test.js` pins the two together so CI catches this instead.\n\nAfter roughly 50 outreach attempts, refit the weights in `scoring_weights` against actual reply rate and bump both the constant and this Config value together \u2014 `lead_scores` is unique on `(business_id, scoring_version)` precisely so the old and new scores can coexist and be compared.\n\n### What happens to a qualified lead\n\nNothing, from here. CH-04 reads `lead_scores.qualified = true` and drafts an outreach message \u2014 this workflow only ever writes the score.",
+        "height": 760,
+        "width": 620,
+        "color": 7
+      },
+      "id": "ch03s-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1480,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Every 10 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Load scoring weights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load scoring weights": {
+      "main": [
+        [
+          {
+            "node": "Pick what needs scoring",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick what needs scoring": {
+      "main": [
+        [
+          {
+            "node": "Score the lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score the lead": {
+      "main": [
+        [
+          {
+            "node": "Drop the empty-batch sentinel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop the empty-batch sentinel": {
+      "main": [
+        [
+          {
+            "node": "Store the score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store the score": {
+      "main": [
+        [
+          {
+            "node": "What did scoring produce?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What did scoring produce?": {
+      "main": [
+        [
+          {
+            "node": "Is this worth a message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is this worth a message?": {
+      "main": [
+        [
+          {
+            "node": "Tell me",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+ "name": "a",
+ "nodes": [
+  {
+   "name": "bad",
+   "type": "n8n-nodes-base.code",
+   "parameters": {
+    "mode": "runOnceForEachItem",
+    "jsCode": "// the accessor below is in a COMMENT and n8n rejects it anyway\n// we used to call $input.first() here\nreturn {json:{}};"
+   }
+  }
+ ],
+ "connections": {}
+}

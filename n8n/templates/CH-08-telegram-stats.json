@@ -1,0 +1,414 @@
+{
+  "name": "CH-08 Client Hunt - Answer /stats on Telegram",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "ch08-trigger",
+      "name": "Message to the bot",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -780,
+        290
+      ],
+      "webhookId": "ch08-telegram-trigger",
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      },
+      "notes": "Telegram calls n8n's public webhook (WEBHOOK_URL) for every message to the Client Hunt bot. Activating this workflow registers that webhook with Telegram."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "s1",
+              "name": "owner_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "s2",
+              "name": "max_per_day",
+              "value": 30,
+              "type": "number"
+            },
+            {
+              "id": "s3",
+              "name": "warmup_start",
+              "value": 20,
+              "type": "number"
+            },
+            {
+              "id": "s4",
+              "name": "warmup_step",
+              "value": 10,
+              "type": "number"
+            },
+            {
+              "id": "s5",
+              "name": "max_bounces",
+              "value": 8,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch08-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "max_per_day, warmup_* and max_bounces mirror CH-05's Config, only to show today's cap and the brake. Change them there first; these only describe."
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "ch08-from-owner.js"
+        }
+      },
+      "id": "ch08-owner",
+      "name": "From the owner?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -340,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.command }}",
+              "rightValue": "concept",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch08-is-concept",
+      "name": "Concept?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -120,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "select-concept-business.sql"
+        },
+        "options": {
+          "queryReplacement": "={{ [$json.arg || ''] }}"
+        }
+      },
+      "id": "ch08-find",
+      "name": "Find the business",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        100,
+        400
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "ch08-concept.js"
+        }
+      },
+      "id": "ch08-build",
+      "name": "Build the concept",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "file",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch08-is-file",
+      "name": "Got a file?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        540,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "={{ $('Config').first().json.owner_chat_id }}",
+        "binaryData": true,
+        "binaryPropertyName": "data",
+        "additionalFields": {
+          "caption": "={{ $json.caption }}"
+        }
+      },
+      "id": "ch08-send-file",
+      "name": "Send the concept",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        760,
+        400
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": {
+          "$sql": "select-stats.sql"
+        },
+        "options": {}
+      },
+      "id": "ch08-numbers",
+      "name": "The numbers",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        100,
+        200
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": {
+          "$snippet": "ch08-stats.js"
+        }
+      },
+      "id": "ch08-write",
+      "name": "Write the answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.owner_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "ch08-reply",
+      "name": "Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        760,
+        200
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-08 \u2014 Answer /stats on Telegram\n\nThe owner sends **/stats** to the Client Hunt bot and gets today's numbers back: sent against today's cap, replies, bounces and the brake, the queue, leads waiting.\n\n**/concept 1234** (the number in a reply alert, or part of a name) sends back a one-page website concept for that business as an HTML file, to screenshot into the reply.\n\nOnly the owner's chat (TELEGRAM_CHAT_ID) is answered; a message from anyone else is dropped without a reply. Reads the database, writes nothing, calls no AI - nothing a stranger types can make it do anything.",
+        "height": 440,
+        "width": 520,
+        "color": 4
+      },
+      "id": "ch08-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1380,
+        160
+      ]
+    }
+  ],
+  "connections": {
+    "Message to the bot": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "From the owner?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "From the owner?": {
+      "main": [
+        [
+          {
+            "node": "Concept?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "The numbers": {
+      "main": [
+        [
+          {
+            "node": "Write the answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write the answer": {
+      "main": [
+        [
+          {
+            "node": "Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Concept?": {
+      "main": [
+        [
+          {
+            "node": "Find the business",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "The numbers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find the business": {
+      "main": [
+        [
+          {
+            "node": "Build the concept",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build the concept": {
+      "main": [
+        [
+          {
+            "node": "Got a file?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Got a file?": {
+      "main": [
+        [
+          {
+            "node": "Send the concept",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

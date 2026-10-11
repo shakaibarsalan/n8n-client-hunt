@@ -1,0 +1,212 @@
+{
+  "name": "CH-04 Client Hunt - Prepare outreach",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "*/10 * * * *" }] }
+      },
+      "id": "ch04-trigger-cron",
+      "name": "Every 10 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-780, 200]
+    },
+    {
+      "parameters": {},
+      "id": "ch04-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-780, 380]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "c1", "name": "batch_size", "value": 40, "type": "number" },
+            { "id": "c2", "name": "telegram_chat_id", "value": "__ENV:TELEGRAM_CHAT_ID__", "type": "string" },
+          {
+            "id": "c3",
+            "name": "auto_approve",
+            "value": true,
+            "type": "boolean"
+          }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch04-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-560, 290],
+      "notes": "This workflow only ever WRITES DRAFTS. Nothing it does sends an email - that is CH-04's job, and CH-04 only sends a row a human has already set to 'approved'."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT country_code, law, note, rule FROM consent_required_countries;",
+        "options": {}
+      },
+      "id": "ch04-consent",
+      "name": "Load consent-required countries",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [-340, 290],
+      "credentials": { "postgres": { "name": "Client Hunt DB" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": { "$sql": "select-outreach-candidates.sql" },
+        "options": {
+          "queryReplacement": "={{ [$('Config').first().json.batch_size] }}"
+        }
+      },
+      "id": "ch04-candidates",
+      "name": "Who is due a message?",
+      "type": "n8n-nodes-base.postgres",
+      "executeOnce": true,
+      "typeVersion": 2.5,
+      "position": [-120, 290],
+      "alwaysOutputData": true,
+      "notes": "A business with no email is not selected at all - nothing to draft yet. When Stage F later finds one, the next run picks it up on its own. Already-suppressed addresses are excluded outright here, not flagged for review.",
+      "credentials": { "postgres": { "name": "Client Hunt DB" } }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": { "$snippet": "detect-natural-person.js" }
+      },
+      "id": "ch04-natural-person",
+      "name": "Is this a natural person or a trading name?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [100, 290],
+      "notes": "A heuristic, not a legal determination. It exists to make the safe default automatic: hold and ask a human, never guess and send."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": { "$sql": "cache-natural-person-flag.sql" },
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.is_natural_person, $json.natural_person_reason || ''] }}"
+        }
+      },
+      "id": "ch04-cache-flag",
+      "name": "Cache the natural-person flag",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [320, 180],
+      "notes": "A dead-end branch on purpose - this just records the flag on the business row for visibility. The main chain below does not wait on it.",
+      "credentials": { "postgres": { "name": "Client Hunt DB" } }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": { "$snippet": "render-outreach-draft.js" }
+      },
+      "id": "ch04-render",
+      "name": "Render the draft and guard it",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [320, 380]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": { "$sql": "insert-outreach-draft.sql" },
+        "options": {
+          "queryReplacement": "={{ [$json.business_id, $json.template_id, $json.sequence_step, $json.to_email, $json.subject, $json.body, $json.status, $json.review_reason || '', JSON.stringify($json.guard_flags), $('Config').first().json.auto_approve ? 'true' : 'false'] }}"
+        }
+      },
+      "id": "ch04-insert",
+      "name": "Insert the draft",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [540, 380],
+      "notes": "ON CONFLICT DO NOTHING - a re-run cannot draft the same step twice, and cannot overwrite a status a human already changed.",
+      "credentials": { "postgres": { "name": "Client Hunt DB" } }
+    },
+    {
+      "parameters": {
+        "jsCode": { "$snippet": "ch04-summary.js" }
+      },
+      "id": "ch04-summary",
+      "name": "What did drafting produce?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [760, 380]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "version": 2 },
+          "conditions": [
+            {
+              "id": "cw1",
+              "leftValue": "={{ $json.quiet }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "false", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch04-worth-saying",
+      "name": "Is this worth a message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [980, 380]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": { "appendAttribution": false }
+      },
+      "id": "ch04-telegram",
+      "name": "Tell me",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1200, 380],
+      "credentials": { "telegramApi": { "name": "Client Hunt Telegram" } }
+    },
+    {
+      "parameters": {
+        "content": "## CH-04 — Prepare outreach\n\n**This workflow never sends anything.** It writes rows to the `outreach` table with status `draft` or `needs_review`. CH-04 is the only workflow with an SMTP node, and CH-04 only sends a row a human has set to `approved`.\n\n### Why a row gets held instead of drafted clean\n\n- **No email found** — not actually possible to reach here (see `select-outreach-candidates.sql`: a business with no email is not selected in the first place).\n- **Natural person detected** — the business name appears to embed a real person's name, and their country either requires prior consent for marketing to a natural person, or its law simply has not been checked yet. Both hold, on purpose: absence of a country from `consent_required_countries` means unverified, not cleared.\n- **Unfilled template placeholder** — a `{{field}}` survived rendering, which means the business is missing something the template assumed it had.\n\n### Approving a draft\n\nThere is deliberately no UI for this yet. Approve one by hand:\n\n```sql\nUPDATE outreach SET status = 'approved', approved_at = now(), approved_by = 'you'\nWHERE id = <the row id>;\n```\n\nReview what is waiting first:\n\n```sql\nSELECT o.id, b.name, o.to_email, o.status, o.review_reason, o.subject\nFROM outreach o JOIN businesses b ON b.id = o.business_id\nWHERE o.status IN ('draft','needs_review')\nORDER BY o.created_at;\n```\n\n### The templates are data, not code\n\nEdit `outreach_templates` directly — no node needs touching:\n\n```sql\nUPDATE outreach_templates SET subject = '...', body = '...'\nWHERE slug = 'default' AND sequence_step = 1;\n```",
+        "height": 760,
+        "width": 640,
+        "color": 6
+      },
+      "id": "ch04-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1480, 100]
+    }
+  ],
+  "connections": {
+    "Every 10 minutes": { "main": [[{ "node": "Config", "type": "main", "index": 0 }]] },
+    "Run manually": { "main": [[{ "node": "Config", "type": "main", "index": 0 }]] },
+    "Config": { "main": [[{ "node": "Load consent-required countries", "type": "main", "index": 0 }]] },
+    "Load consent-required countries": { "main": [[{ "node": "Who is due a message?", "type": "main", "index": 0 }]] },
+    "Who is due a message?": { "main": [[{ "node": "Is this a natural person or a trading name?", "type": "main", "index": 0 }]] },
+    "Is this a natural person or a trading name?": {
+      "main": [[
+        { "node": "Cache the natural-person flag", "type": "main", "index": 0 },
+        { "node": "Render the draft and guard it", "type": "main", "index": 0 }
+      ]]
+    },
+    "Render the draft and guard it": { "main": [[{ "node": "Insert the draft", "type": "main", "index": 0 }]] },
+    "Insert the draft": { "main": [[{ "node": "What did drafting produce?", "type": "main", "index": 0 }]] },
+    "What did drafting produce?": { "main": [[{ "node": "Is this worth a message?", "type": "main", "index": 0 }]] },
+    "Is this worth a message?": { "main": [[{ "node": "Tell me", "type": "main", "index": 0 }], []] }
+  }
+}

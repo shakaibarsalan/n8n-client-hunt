@@ -1,0 +1,197 @@
+# Runs on GitHub's own machines. No server involved, no secrets needed, so it
+# is safe on a pull request from anywhere.
+#
+# The build check is first and is not a formality. n8n/workflows/*.json is
+# GENERATED from the snippets, and a stale build means the tests below would
+# be checking code that is not the code anybody is editing.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The workflow JSON must match the snippets it is generated from.
+      # Without this, somebody edits a snippet, forgets to rebuild, and the
+      # import pushes the previous version of the code to n8n.
+      - name: Built workflows are up to date
+        run: node tools/build-workflows.js --check
+
+      # The three classes of fault n8n rejects but JavaScript does not:
+      # per-item accessors (including inside comments), bodies that do not
+      # parse as async, and expressions that do not evaluate.
+      - name: n8n preflight
+        run: node tests/n8n-node-preflight.js
+
+      # A linter that has quietly stopped working reports "all clear" for ever.
+      - name: Preflight still catches faults
+        run: node tests/preflight-self.test.js
+
+      - name: Dedup and normalisation
+        run: node tests/dedup.test.js
+
+      # A refused search key must stop the run, not verify leads blind.
+      - name: Stage C - search for them
+        run: node tests/stage-c-search.test.js
+
+      - name: Stage D - prove the domain
+        run: node tests/prove-domain.test.js
+
+      - name: Website classification
+        run: node tests/website-classification.test.js
+
+      # An http:// address an open dataset stored is not evidence of no HTTPS.
+      - name: Stage E - is the site any good?
+        run: node tests/quality-check.test.js
+
+      # The seam where a silent failure would cost the most: if the JS and
+      # Python normalisers disagree, Stage B stops matching and every lead
+      # quietly downgrades from CONFIRMED to LIKELY with no error anywhere.
+      - name: Normalisation parity (JS vs Python)
+        run: node tests/normalisation-parity.test.js
+
+      - name: Against the actor's real output shape
+        run: node tests/real-apify-output.test.js
+
+      - name: Stage B platform filter
+        run: node tests/stage-b-platform-filter.test.js
+
+      - name: Stage F - find a contact email
+        run: node tests/stage-f-find-email.test.js
+
+      - name: score-lead.js
+        run: node tests/score-lead.test.js
+
+      # A version mismatch here does not error at runtime - it just means
+      # nothing ever gets scored again, silently, because every business
+      # already has a row under the version nobody is asking for.
+      - name: scoring_version stays in sync
+        run: node tests/score-lead-version.test.js
+
+      # The consent hold. False negatives here are the dangerous direction -
+      # a natural person mailed without prior consent - so this is checked
+      # against stand-ins that keep the exact shape of the real business names
+      # the heuristic was tuned on.
+      - name: Natural-person detection
+        run: node tests/detect-natural-person.test.js
+
+      - name: Render and guard the outreach draft
+        run: node tests/render-outreach-draft.test.js
+
+      - name: CH-05 send brake
+        run: node tests/brake-may-we-send.test.js
+
+      # Missing a reply means the person who answered still gets the follow-up.
+      # Mistaking our own BCC copy for a reply stops a sequence nobody answered.
+      - name: CH-06 classify inbound mail
+        run: node tests/classify-inbound-mail.test.js
+
+      - name: Python tools compile
+        run: python -m py_compile tools/*.py deploy/*.py
+
+  sql:
+    # The migrations claim to be idempotent. This is where that claim is
+    # tested, against a real Postgres, rather than believed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: clienthunt
+          POSTGRES_USER: clienthunt
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+        options: >-
+          --health-cmd "pg_isready -U clienthunt"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+        ports: ['5432:5432']
+
+    env:
+      PGPASSWORD: ci-only-not-a-secret
+      PSQL: psql -v ON_ERROR_STOP=1 -q -h localhost -U clienthunt -d clienthunt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Schema applies cleanly
+        run: |
+          for f in db/*.sql; do echo "-- $f"; $PSQL -f "$f"; done
+
+      - name: And applies twice, as a no-op
+        run: |
+          for f in db/*.sql; do echo "-- $f (again)"; $PSQL -f "$f"; done
+
+      - name: Seeded data is what the workflows expect
+        run: |
+          # Derived from the files on disk, not written down as a number.
+          # The first version asserted "3" and went stale the moment a fourth
+          # migration was added - the check failed on a change that was
+          # correct, which is the kind of false alarm that gets a check
+          # deleted rather than fixed.
+          EXPECTED=$(ls db/*.sql | wc -l)
+          echo "expecting $EXPECTED migrations"
+          $PSQL -At -c "
+            SELECT 'FAIL: expected $EXPECTED migrations, got ' || count(*)
+              FROM schema_migrations HAVING count(*) <> $EXPECTED;
+            SELECT 'FAIL: expected exactly 2 enabled targets, got ' || count(*)
+              FROM search_targets WHERE enabled HAVING count(*) <> 2;
+            SELECT 'FAIL: platform_domains looks empty'
+              FROM platform_domains HAVING count(*) < 50;
+            SELECT 'FAIL: apify_spend brake row is missing'
+              FROM app_state WHERE key='apify_spend' HAVING count(*) <> 1;
+            SELECT 'FAIL: outreach_templates looks empty'
+              FROM outreach_templates HAVING count(*) < 2;
+            SELECT 'FAIL: ' || slug || ' template is missing its step-1 or step-2 message'
+              FROM outreach_templates GROUP BY slug
+              HAVING count(*) FILTER (WHERE sequence_step IN (1, 2)) <> 2;
+            SELECT 'FAIL: ' || slug || ' sequence has a gap (a step with no step before it)'
+              FROM outreach_templates t WHERE sequence_step > 1 AND NOT EXISTS (
+                SELECT 1 FROM outreach_templates p WHERE p.slug = t.slug AND p.sequence_step = t.sequence_step - 1);
+            SELECT 'FAIL: consent_required_countries looks empty'
+              FROM consent_required_countries HAVING count(*) < 4;
+            SELECT 'FAIL: Norway is not in consent_required_countries'
+              WHERE NOT EXISTS (SELECT 1 FROM consent_required_countries WHERE country_code = 'no');
+          " | tee /tmp/checks
+          # Any output at all means an assertion fired.
+          if [ -s /tmp/checks ]; then cat /tmp/checks; exit 1; fi
+          echo "seed data OK"
+
+      - name: The queries the workflows run actually parse
+        run: |
+          # PREPARE forces a full parse and plan without executing anything,
+          # which catches a typo in a query that would otherwise only surface
+          # the first time the workflow runs against live data.
+          # '$ s/...' anchors the edit to the LAST line only. A bare
+          # 's/;$//' would strip a semicolon from every line that ends in one,
+          # which silently rewrites the query being tested.
+          #
+          # Every file in n8n/sql/, not a named list - the earlier hand-kept
+          # list covered 3 of the (then) 5 query files and nobody noticed
+          # write-verdict.sql and upsert-business.sql were never checked here
+          # until this comment was written to explain why the list became a
+          # glob.
+          n=0
+          for f in n8n/sql/*.sql; do
+            n=$((n+1))
+            $PSQL -c "PREPARE q$n AS $(sed -e '$ s/;[[:space:]]*$//' "$f")" >/dev/null
+            echo "  $(basename "$f") ok"
+          done

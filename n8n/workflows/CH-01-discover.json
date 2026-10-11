@@ -1,0 +1,700 @@
+{
+  "name": "CH-01 Client Hunt - Discover businesses",
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Karachi"
+  },
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "*/30 * * * *"
+            }
+          ]
+        }
+      },
+      "id": "ch01-trigger-cron",
+      "name": "Every 30 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -780,
+        200
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ch01-trigger-manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -780,
+        380
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "apify_actor_id",
+              "value": "compass~google-maps-extractor",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "apify_base",
+              "value": "https://api.apify.com/v2",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "poll_seconds",
+              "value": 20,
+              "type": "number"
+            },
+            {
+              "id": "a4",
+              "name": "max_polls",
+              "value": 40,
+              "type": "number"
+            },
+            {
+              "id": "a5",
+              "name": "telegram_chat_id",
+              "value": "__ENV:TELEGRAM_CHAT_ID__",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "default_min_lead_score",
+              "value": 60,
+              "type": "number"
+            },
+            {
+              "id": "a7",
+              "name": "apify_cost_per_place",
+              "value": 0.007,
+              "type": "number"
+            },
+            {
+              "id": "a8",
+              "name": "apify_reserve_usd",
+              "value": 0.3,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ch01-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -560,
+        290
+      ],
+      "notes": "Every run-level knob lives here. Niche and location do NOT - they come from the search_targets table. This node exists because the instance has no Variables licence and $env is blocked below Enterprise. Values written as __ENV:<VARNAME>__ are replaced at import time from the environment, so a secret never enters this file or git. A placeholder left unreplaced means the variable was not set, and the node that uses it degrades rather than sending a literal \"__ENV:...__\" anywhere."
+    },
+    {
+      "parameters": {
+        "url": "https://api.apify.com/v2/users/me/limits",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "ch01-credit",
+      "name": "How much credit is left?",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -450,
+        150
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apify token"
+        }
+      },
+      "notes": "Asks Apify what is actually left rather than trusting a number we wrote down. This endpoint is free and does not consume credit. It exists because our own place counter can only ever under-estimate: Apify also bills for actor starts and for each filter applied per place, so a cap expressed in places drifts below the real spend."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-01: which markets are due a run?\n--\n-- The whole configurability requirement lives in this query. n8n asks the\n-- database what to hunt; it does not know the answer itself. Changing\n-- \"Beauty Salons in Oslo\" to \"Dental Clinics in Dubai\" is an INSERT into\n-- search_targets, not an edit to any node.\n--\n-- cooldown_hours is what makes a DAILY schedule return NEW businesses rather\n-- than re-scraping the same city every morning and paying for it again.\n--\n-- LIMIT is deliberate. One target per run keeps a bad target from consuming\n-- the whole monthly Apify credit before anyone notices.\n\nSELECT\n  t.id,\n  t.niche,\n  t.niche_query,\n  t.category_filter,\n  t.country,\n  -- Lowercase ISO-2. The scraper's countryCode is an enum of these and\n  -- rejects country names; without it a search is not restricted at all.\n  t.country_code,\n  t.state,\n  t.city,\n  t.postal_code,\n  t.custom_geolocation,\n  t.cctlds,\n  t.max_results,\n  t.min_lead_score,\n  t.daily_lead_limit,\n  t.include_social_only,\n  t.include_weak_website,\n  t.min_review_count,\n  t.min_rating,\n  -- The spend brake travels with the target so the node that starts the run\n  -- can refuse without a second query.\n  --\n  -- Scalar subqueries rather than a join to app_state. A CROSS JOIN here\n  -- means that if the apify_spend row is ever missing, this query returns NO\n  -- ROWS AT ALL - and the brake node reads that as \"no target is due\", which\n  -- it reports as the schedule working normally. A missing brake row would\n  -- silently look like a healthy idle pipeline. COALESCE to a cap of 0\n  -- instead, which fails closed: no row, no spending.\n  COALESCE((SELECT (value ->> 'places_scraped')::int\n              FROM app_state WHERE key = 'apify_spend'), 0) AS spend_places_scraped,\n  COALESCE((SELECT (value ->> 'monthly_place_cap')::int\n              FROM app_state WHERE key = 'apify_spend'), 0) AS spend_monthly_cap,\n  (SELECT value ->> 'month' FROM app_state WHERE key = 'apify_spend') AS spend_month,\n  to_char(now(), 'YYYY-MM')                AS current_month\nFROM search_targets t\nWHERE t.enabled\n  -- Open-data-only targets (CH-00) never reach Apify. See db/011.\n  AND t.apify_enabled\n  AND (\n    t.last_run_at IS NULL\n    OR t.last_run_at < now() - make_interval(hours => t.cooldown_hours)\n  )\nORDER BY\n  t.last_run_at ASC NULLS FIRST,   -- never-run targets go first\n  t.id ASC\nLIMIT 1;\n",
+        "options": {}
+      },
+      "id": "ch01-select-target",
+      "name": "Pick one target",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -340,
+        290
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-01, node: \"BRAKE: can we afford this run?\"\n// Mode: Run Once for All Items\n//\n// Decides whether to spend money, and builds the Apify input if so.\n//\n// This node exists in this position - before the first live request, not\n// after the first surprise bill - because of a specific lesson from the\n// LinkedIn project's post-mortem:\n//\n//     \"The budget goes in before the first live request, not after the\n//      fourth bug. Brakes are not a later refinement.\"\n//\n// That project's hard cap was written on the night of the incident it would\n// have prevented. Apify's free plan is $5 a month with no rollover and it\n// BLOCKS runs at zero rather than warning first, so the failure mode here is\n// a pipeline that silently stops producing leads on the 14th of the month\n// and looks, from the outside, exactly like a pipeline that found nothing.\n\nconst rows = $input.all().map((i) => i.json);\nconst CFG = $('Config').first().json;\n\n// No due target is the normal state most days: cooldown_hours is doing its\n// job. That is the system idling correctly, not a fault, and it must not look\n// like one in the report.\nif (!rows.length) {\n  return [{\n    json: {\n      go: false,\n      reason: 'no target is due - every enabled market is still inside its cooldown window. ' +\n              'This is the schedule working, not a failure.',\n      quiet: true,\n    },\n  }];\n}\n\nconst t = rows[0];\n\n// --- the spend check -------------------------------------------------------\n//\n// TWO limits, and the run needs room under BOTH.\n//\n//   1. What Apify says is actually left this month. This is the truth, asked\n//      live, and it is the one that matters. Our own place counter can only\n//      ever under-estimate: Apify bills for the actor start and for each\n//      filter applied per place as well as for the place itself, so a budget\n//      expressed in places drifts below the real spend and would eventually\n//      let a run start with nothing left to pay for it.\n//\n//   2. Our own monthly place cap in app_state. Kept as a deliberate ceiling\n//      you can lower below the plan's - useful when the credit is shared with\n//      something else, and it still works if the limits endpoint is down.\n//\n// Both fail CLOSED. A brake whose input is missing refuses.\n\n// --- limit 1: live credit -------------------------------------------------\nlet creditRemainingUsd = null;\ntry {\n  const lim = $('How much credit is left?').first().json.data;\n  const usedUsd = Number(lim.current.monthlyUsageUsd);\n  const maxUsd = Number(lim.limits.maxMonthlyUsageUsd);\n  if (Number.isFinite(usedUsd) && Number.isFinite(maxUsd)) {\n    creditRemainingUsd = maxUsd - usedUsd;\n  }\n} catch (e) {\n  // Leaving it null is what makes the next block refuse. An unreachable\n  // limits endpoint is not permission to spend.\n}\n\nif (creditRemainingUsd === null) {\n  return [{\n    json: {\n      go: false,\n      reason: 'could not read the Apify credit limit, so there is no way to know what a run ' +\n              'would cost against what is left. Refusing rather than guessing. Check the ' +\n              '\"Apify token\" credential and the How much credit is left? node.',\n      quiet: false,\n    },\n  }];\n}\n\n// A reserve, because the per-place rate is not the whole bill. The actor start\n// is $0.007 and each filter applied costs $0.001 per place, so a run that\n// exactly exhausts the remaining dollars stops part-way through - which costs\n// the same money and returns a partial, geographically biased slice of a city.\nconst perPlace = Number(CFG.apify_cost_per_place || 0.005);\nconst reserve = Number(CFG.apify_reserve_usd || 0.30);\nconst affordableByCredit = Math.floor(Math.max(0, creditRemainingUsd - reserve) / perPlace);\n\n// --- limit 2: our own ceiling ---------------------------------------------\n// The counter resets itself on month rollover in the same statement that\n// increments it, so a stale month here means the counter has simply not been\n// touched yet this month and reads as zero.\nconst sameMonth = t.spend_month === t.current_month;\nconst used = sameMonth ? Number(t.spend_places_scraped || 0) : 0;\nconst cap = Number(t.spend_monthly_cap || 0);\n\n// A missing or zero cap does NOT mean \"unlimited\".\n//\n// An earlier version read `cap > 0 ? cap - used : Infinity`, so deleting the\n// app_state row - or fat-fingering the JSON in it - switched the brake off\n// entirely. That is precisely the shape of the mistake the sibling project\n// made: \"a bounce counter with nothing that sets it would have been a brake\n// wired to nothing.\"\nif (!Number.isFinite(cap) || cap <= 0) {\n  return [{\n    json: {\n      go: false,\n      reason: 'no Apify place cap is configured (app_state.apify_spend.monthly_place_cap ' +\n              'is missing or zero). Refusing rather than spending without a ceiling. ' +\n              'Set a number - a large one if you really want no cap of our own.',\n      quiet: false,\n    },\n  }];\n}\n\nconst affordableByCap = cap - used;\nconst remaining = Math.min(affordableByCredit, affordableByCap);\nconst binding = affordableByCredit <= affordableByCap ? 'Apify credit' : 'our own monthly cap';\n\nif (remaining <= 0) {\n  return [{\n    json: {\n      go: false,\n      reason: `out of budget (${binding} is the limit). ` +\n              `$${creditRemainingUsd.toFixed(2)} credit left, which buys about ` +\n              `${affordableByCredit} places; our own cap allows ${affordableByCap} more ` +\n              `(${used}/${cap} used in ${t.current_month}). No run started.`,\n      // Routine once the month's budget is used - CH-07's digest is enough;\n      // a Telegram message every 30 minutes was not.\n      quiet: true,\n    },\n  }];\n}\n\n// Never ask for more than the budget can pay for. Asking for 150 with 40 left\n// does not fail politely - it spends the 40 and stops mid-scrape, which costs\n// the same and returns a partial, biased slice of the city.\nconst want = Math.min(Number(t.max_results || 100), remaining);\n\nif (want < 10) {\n  return [{\n    json: {\n      go: false,\n      reason: `only ${remaining} places left in this month's cap - too few for a meaningful ` +\n              `run, so nothing was started rather than half-scraping ${t.city || t.country}.`,\n      // Routine once the month's budget is used - CH-07's digest is enough;\n      // a Telegram message every 30 minutes was not.\n      quiet: true,\n    },\n  }];\n}\n\n// --- build the Apify input -------------------------------------------------\n//\n// website: 'withoutWebsite' is the single most important line in this repo.\n// It is the reason discovery is cheap: the actor returns only businesses whose\n// Maps listing carries no website, so we pay for prospects rather than for a\n// whole city we then throw 73% of away.\n//\n// It is emphatically NOT the answer on its own - a listing with no website\n// field is a candidate, and CH-02 exists to find out whether it is true.\nconst input = {\n  searchStringsArray: [t.niche_query],\n  maxCrawledPlacesPerSearch: want,\n  language: 'en',\n  website: 'withoutWebsite',\n  skipClosedPlaces: true,\n  scrapeContacts: false,\n};\n\n// Location. A custom polygon wins over the free-text fields when one is set,\n// because a city name is ambiguous in a way a polygon is not.\nif (t.custom_geolocation) {\n  input.customGeolocation = t.custom_geolocation;\n} else {\n  if (t.city) input.city = t.city;\n  if (t.state) input.state = t.state;\n  if (t.postal_code) input.postalCode = t.postal_code;\n\n  // countryCode is an ENUM of lowercase ISO-2 codes, not a country name. An\n  // earlier version passed \"Norway\" here, which is not in the enum - the run\n  // would have searched with no country at all, and \"beauty salon\" unscoped is\n  // a global search that would have spent the month's credit on results from\n  // anywhere. Refusing is the only safe response to a missing code.\n  if (!t.country_code) {\n    return [{\n      json: {\n        go: false,\n        reason: `target ${t.id} (${t.niche} / ${t.country}) has no country_code and no ` +\n                `custom_geolocation. The scraper needs a lowercase ISO-2 code; without one ` +\n                `the search would not be restricted to any country at all. No run started.`,\n        quiet: false,\n      },\n    }];\n  }\n  input.countryCode = String(t.country_code).toLowerCase();\n}\n\nif (Array.isArray(t.category_filter) && t.category_filter.length) {\n  input.categoryFilterWords = t.category_filter;\n}\n\n// placeMinimumStars is an enum of WORDS - 'four', 'fourAndHalf' - not a\n// number. String(4.5) is not in the enum, so passing the rating straight\n// through silently dropped the filter.\nif (t.min_rating) {\n  const STARS = {\n    '2': 'two', '2.5': 'twoAndHalf',\n    '3': 'three', '3.5': 'threeAndHalf',\n    '4': 'four', '4.5': 'fourAndHalf',\n  };\n  const word = STARS[String(Number(t.min_rating))];\n  // An unmappable value is left out rather than guessed at. Dropping a filter\n  // costs a few extra places; sending an invalid enum fails the whole run.\n  if (word) input.placeMinimumStars = word;\n}\n\nreturn [{\n  json: {\n    go: true,\n    target_id: t.id,\n    niche: t.niche,\n    niche_query: t.niche_query,\n    city: t.city,\n    country: t.country,\n    asked_for: want,\n    budget_remaining: remaining,\n    budget_binding: binding,\n    credit_remaining_usd: Number(creditRemainingUsd.toFixed(2)),\n    apify_input: input,\n    // Carried through for the normaliser, which needs the target's fields and\n    // should not have to query for them again.\n    ...t,\n  },\n}];\n"
+      },
+      "id": "ch01-budget",
+      "name": "BRAKE: can we afford this run?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.go }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch01-gate",
+      "name": "Cleared to spend?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        100,
+        290
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.apify_base }}/acts/{{ $('Config').first().json.apify_actor_id }}/runs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.apify_input) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "ch01-start-run",
+      "name": "Start the scrape",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        200
+      ],
+      "notes": "Plain HTTP rather than the Apify community node: that node is not installed on this instance, and an HTTP call has no community-package dependency to break on an n8n upgrade.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apify token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": "={{ $('Config').first().json.poll_seconds }}",
+        "unit": "seconds"
+      },
+      "id": "ch01-wait",
+      "name": "Wait 20s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        540,
+        200
+      ],
+      "webhookId": "ch01-wait-webhook"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Config').first().json.apify_base }}/actor-runs/{{ $('Start the scrape').first().json.data.id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "ch01-poll",
+      "name": "Is it finished?",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        200
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apify token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ ['READY','RUNNING'].includes($json.data.status) && $runIndex < $('Config').first().json.max_polls }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch01-still-running",
+      "name": "Still running?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        980,
+        200
+      ],
+      "notes": "Polling, not run-sync-get-dataset-items: that endpoint gives up after 5 minutes and a Maps scrape regularly runs longer. The $runIndex cap is what stops this looping forever when a run hangs - roughly 13 minutes at 20s per poll."
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Config').first().json.apify_base }}/datasets/{{ $('Is it finished?').first().json.data.defaultDatasetId }}/items",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "clean",
+              "value": "true"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "ch01-dataset",
+      "name": "Collect the results",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "Apify token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-01, node: \"Normalise the business\"\n// Mode: Run Once for All Items\n//\n// Turns whatever the Apify actor happened to return into the shape the\n// businesses table expects, and computes the three dedup keys.\n//\n// Two things here are defensive on purpose:\n//\n//   1. Field names. Apify's Maps actors do not agree with each other and do\n//      not agree with their own previous versions. Every read goes through\n//      pick(), which tries several spellings. The whole record is kept in\n//      `raw` so a field that moves can be re-mapped later without re-scraping\n//      and re-paying for it.\n//\n//   2. Accents. This project targets Norway, Spain, Portugal, Italy and the\n//      UAE. \"Fris\u00f8r\" and \"frisor\", \"Peluquer\u00eda\" and \"peluqueria\" are the same\n//      business, and a name key that does not fold them produces a duplicate\n//      on every second Scandinavian salon. NFD-normalising before stripping\n//      combining marks is what makes name_norm stable across sources \u2014 which\n//      matters most at Stage B, where we match Google's spelling against\n//      Overture's.\n\nconst CFG = $('Config').first().json;\nconst target = $('Pick one target').first().json;\n\n// --- field access ----------------------------------------------------------\nconst pick = (o, ...keys) => {\n  for (const k of keys) {\n    const v = k.split('.').reduce((a, p) => (a == null ? a : a[p]), o);\n    if (v !== undefined && v !== null && v !== '') return v;\n  }\n  return '';\n};\n\n// --- name normalisation ----------------------------------------------------\n// Legal forms carry no identifying information and are written inconsistently\n// across sources: \"Salong Eksempel AS\" in Google is often \"Salong Eksempel\" in\n// Overture. Stripping them is what lets the two match.\nconst LEGAL = new Set([\n  // Scandinavia\n  'as', 'asa', 'ans', 'da', 'nuf', 'ab', 'hb', 'kb', 'aps', 'is', 'ks',\n  // Southern Europe\n  'sl', 'slu', 'sa', 'sau', 'lda', 'unipessoal', 'srl', 'srls', 'spa', 'snc', 'sas',\n  // Gulf\n  'llc', 'lc', 'fze', 'fzco', 'fzllc', 'dmcc', 'est', 'establishment',\n  // Anglo\n  'inc', 'ltd', 'limited', 'corp', 'corporation', 'co', 'company', 'ulc', 'plc',\n  // Generic filler\n  'the', 'and', 'group', 'holdings', 'international',\n]);\n\n// Folds accents so that the same business matches across sources.\n// NFD splits an accented letter into base + combining mark; the mark is\n// then stripped by code point rather than by a literal character class,\n// because this file is round-tripped through JSON on its way into n8n and\n// a literal combining mark does not survive that reliably.\nconst COMBINING = /[\u0300-\u036f]/g;\n// Letters that do NOT decompose under NFD and so must be mapped by hand.\n// Norwegian and Danish alone make this non-optional: without it, every\n// \"Frisor\" / \"Fris\u00f8r\" pair is two businesses instead of one.\nconst FOLD = [\n  [/\u00f8/g, 'o'], [/\u00d8/g, 'o'],   // o-slash\n  [/\u00e6/g, 'ae'], [/\u00c6/g, 'ae'], // ae ligature\n  [/\u00e5/g, 'a'], [/\u00c5/g, 'a'],   // a-ring\n  [/\u00df/g, 'ss'],                     // sharp s\n  [/\u0111/g, 'd'], [/\u0142/g, 'l'],   // d-stroke, l-stroke\n  [/\u0153/g, 'oe'], [/\u0152/g, 'oe'], // oe ligature - matters for Quebec\n  [/\u00fe/g, 'th'], [/\u00f0/g, 'd'],  // thorn, eth\n];\nconst deaccent = (s) => {\n  let t = String(s || '').normalize('NFD').replace(COMBINING, '');\n  for (const [re, to] of FOLD) t = t.replace(re, to);\n  return t;\n};\n\nconst normaliseName = (raw) => {\n  const words = deaccent(raw)\n    .toLowerCase()\n    // Dots are CLOSED UP, not turned into spaces. Southern-European legal\n    // forms are written \"S.L.\", \"S.p.A.\", \"A/S\" \u2014 splitting on the dots turns\n    // one legal form into several single letters, which then survive the\n    // LEGAL filter because \"s\" and \"l\" are not \"sl\". That produced\n    // \"peluqueria sol s l\" where Overture holds \"peluqueria sol\", so the two\n    // never matched and Stage B silently stopped catching Spanish\n    // false positives.\n    .replace(/[.\\/]/g, '')\n    .replace(/&/g, ' and ')\n    .replace(/[^a-z0-9 ]/g, ' ')\n    .split(/\\s+/)\n    .filter(Boolean)\n    .filter((w) => !LEGAL.has(w))\n    // A bare single letter left over from an abbreviation is noise, never a\n    // distinguishing feature of a business name.\n    .filter((w) => w.length > 1 || /[0-9]/.test(w));\n  return words.join(' ').trim();\n};\n\n// --- phone -----------------------------------------------------------------\n// E.164 is the strongest dedup key there is: two listings that share a phone\n// number are the same business, whatever they call themselves.\nconst DIAL = {\n  'norway': '47', 'sweden': '46', 'denmark': '45', 'finland': '358',\n  'united arab emirates': '971', 'qatar': '974', 'saudi arabia': '966',\n  'spain': '34', 'portugal': '351', 'italy': '39', 'greece': '30',\n  'canada': '1', 'united states': '1', 'pakistan': '92',\n};\n\nconst toE164 = (raw, country) => {\n  let s = String(raw || '').trim();\n  if (!s) return '';\n  const hasPlus = s.startsWith('+');\n  s = s.replace(/[^\\d]/g, '');\n  if (!s) return '';\n  if (hasPlus) return '+' + s;\n  if (s.startsWith('00')) return '+' + s.slice(2);\n\n  const cc = DIAL[String(country || '').toLowerCase()];\n  if (!cc) return '';                       // unknown country: refuse to guess\n  // A national number conventionally carries a trunk 0 that E.164 drops.\n  // Getting this wrong makes every Italian number a non-match, so Italy is\n  // the exception worth knowing: it KEEPS its leading 0 on landlines.\n  if (s.startsWith(cc) && s.length > String(cc).length + 5) return '+' + s;\n  if (s.startsWith('0') && cc !== '39') s = s.slice(1);\n  return '+' + cc + s;\n};\n\n// --- geohash ---------------------------------------------------------------\n// Precision 7 is roughly a 153m x 153m cell. Chosen because it is about the\n// size of a city block: two listings of the same salon rarely differ by more\n// than a few metres, and two DIFFERENT salons with the same normalised name\n// inside one block is rare enough to accept as a collision.\n//\n// Written out rather than imported because an n8n Code node has no packages.\nconst B32 = '0123456789bcdefghjkmnpqrstuvwxyz';\nconst geohash = (lat, lon, precision) => {\n  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return '';\n  // Null island. pick() returns '' for a missing field and Number('') is 0, so\n  // a business with no coordinates lands at 0,0 and hashes to 7zzzzzz - the\n  // SAME cell as every other business with no coordinates. Combined with\n  // name_norm that is a dedup key which starts merging unrelated businesses,\n  // and a Stage B cross-check that matches them against each other. An\n  // absent coordinate has to stay absent.\n  if (lat === 0 && lon === 0) return '';\n  let latMin = -90, latMax = 90, lonMin = -180, lonMax = 180;\n  let hash = '', bits = 0, ch = 0, even = true;\n  while (hash.length < precision) {\n    if (even) {\n      const mid = (lonMin + lonMax) / 2;\n      if (lon > mid) { ch = (ch << 1) + 1; lonMin = mid; } else { ch = ch << 1; lonMax = mid; }\n    } else {\n      const mid = (latMin + latMax) / 2;\n      if (lat > mid) { ch = (ch << 1) + 1; latMin = mid; } else { ch = ch << 1; latMax = mid; }\n    }\n    even = !even;\n    if (++bits === 5) { hash += B32[ch]; bits = 0; ch = 0; }\n  }\n  return hash;\n};\n\n// --- social profiles -------------------------------------------------------\nconst SOCIAL_KEYS = [\n  ['facebook', 'facebooks', 'facebookUrl'],\n  ['instagram', 'instagrams', 'instagramUrl'],\n  ['linkedin', 'linkedIns', 'linkedinUrl'],\n  ['twitter', 'twitters', 'twitterUrl'],\n  ['tiktok', 'tiktoks', 'tiktokUrl'],\n  ['youtube', 'youtubes', 'youtubeUrl'],\n];\n\nconst collectSocials = (p) => {\n  const out = {};\n  for (const [name, ...aliases] of SOCIAL_KEYS) {\n    const v = pick(p, name, ...aliases);\n    if (!v) continue;\n    out[name] = Array.isArray(v) ? v[0] : v;\n  }\n  return out;\n};\n\n// ---------------------------------------------------------------------------\n\nconst rows = $input.all().map((i) => i.json);\n\n// An empty result is ambiguous \u2014 it can mean \"the actor returned nothing\" or\n// \"the HTTP node handed us the wrong shape\" \u2014 and the two need different\n// fixes. Saying which it is here saves the half hour of reading execution\n// output that the job-hunt repo spent learning to do this.\nif (!rows.length) {\n  throw new Error(\n    `Apify returned 0 items for \"${target.niche_query}\" in ${target.city || target.country}. ` +\n    `Either the search genuinely has no results without websites, or the dataset ` +\n    `id was wrong. Check the run in the Apify console before changing this node.`\n  );\n}\n\nconst out = [];\nconst seen = new Set();\nlet skippedNoId = 0;\nlet skippedClosed = 0;\n\nfor (const p of rows) {\n  const placeId = String(pick(p, 'placeId', 'place_id', 'placeID', 'cid', 'fid') || '').trim();\n  if (!placeId) { skippedNoId++; continue; }\n  if (seen.has(placeId)) continue;             // within-batch dedup\n  seen.add(placeId);\n\n  const closed = Boolean(pick(p, 'permanentlyClosed', 'permanently_closed') === true);\n  if (closed) { skippedClosed++; continue; }   // a closed business is not a lead\n\n  const name = String(pick(p, 'title', 'name', 'placeName') || '').trim();\n  if (!name) { skippedNoId++; continue; }\n\n  const country = String(pick(p, 'countryCode', 'country') || target.country || '');\n  // Number('') is 0, so an absent coordinate has to be rejected before the\n  // conversion rather than after it.\n  const numOrNull = (v) => {\n    if (v === '' || v === null || v === undefined) return null;\n    const n = Number(v);\n    return Number.isFinite(n) ? n : null;\n  };\n  const lat = numOrNull(pick(p, 'location.lat', 'latitude', 'lat'));\n  const lon = numOrNull(pick(p, 'location.lng', 'location.lon', 'longitude', 'lng', 'lon'));\n  const phoneRaw = String(pick(p, 'phone', 'phoneUnformatted', 'internationalPhoneNumber') || '');\n\n  const categories = []\n    .concat(pick(p, 'categories', 'categoryName') || [])\n    .flat()\n    .filter(Boolean)\n    .map(String);\n\n  out.push({\n    json: {\n      google_place_id: placeId,\n      search_target_id: target.id,\n      niche: target.niche,\n\n      name,\n      name_norm: normaliseName(name),\n      category_primary: String(pick(p, 'categoryName', 'category') || categories[0] || ''),\n      categories,\n\n      address: String(pick(p, 'address', 'formattedAddress') || ''),\n      street: String(pick(p, 'street') || ''),\n      city: String(pick(p, 'city', 'locality') || target.city || ''),\n      state: String(pick(p, 'state', 'region') || target.state || ''),\n      country: target.country,\n      country_code: String(pick(p, 'countryCode') || ''),\n      postal_code: String(pick(p, 'postalCode', 'zip') || ''),\n      lat,\n      lon,\n      geohash7: geohash(lat, lon, 7),\n\n      phone_raw: phoneRaw,\n      phone_e164: toE164(phoneRaw, country) || toE164(phoneRaw, target.country),\n      email: String(pick(p, 'email', 'emails.0') || ''),\n      listing_url: String(pick(p, 'url', 'placeUrl', 'googleMapsUrl') || ''),\n      social_profiles: collectSocials(p),\n\n      rating: Number(pick(p, 'totalScore', 'rating')) || null,\n      review_count: Number(pick(p, 'reviewsCount', 'userRatingCount', 'reviews')) || 0,\n      price_level: String(pick(p, 'price', 'priceLevel') || ''),\n      permanently_closed: false,\n      temporarily_closed: Boolean(pick(p, 'temporarilyClosed') === true),\n\n      // What the SOURCE said. Stage A decides what it means; this node does\n      // not classify, it only records. Keeping the two separate is what lets\n      // the classifier be re-run over old rows when its rules change.\n      source_website_raw: String(pick(p, 'website', 'webSite', 'url_website') || ''),\n\n      raw: p,\n      source: 'apify:google-maps-extractor',\n    },\n  });\n}\n\nif (!out.length) {\n  throw new Error(\n    `All ${rows.length} Apify rows were discarded: ${skippedNoId} had no place id or name, ` +\n    `${skippedClosed} were permanently closed. Nothing was stored.`\n  );\n}\n\nreturn out;\n"
+      },
+      "id": "ch01-normalise",
+      "name": "Normalise the business",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- CH-01: store a discovered business, idempotently.\n--\n-- Re-running a search must be free and must not create duplicates. The\n-- UNIQUE index on google_place_id is the structural guarantee; this statement\n-- is how the workflow cooperates with it.\n--\n-- What an existing row KEEPS on re-discovery:\n--\n--   * first_seen_at   - when we actually first saw them\n--   * website_status  - CH-02's verdict. CH-01 must never reset a verified\n--                       business back to PENDING, or every daily run would\n--                       re-verify the whole database and re-spend on it.\n--     This is the same shape of bug as the job-hunt repo's\n--     \"Flow 02 mapped Status: 'queued' and reset rows already marked sent\",\n--     which emailed six companies two or three times.\n--\n-- What it updates: the volatile facts. Ratings and review counts move, phone\n-- numbers change, businesses close.\n--\n-- google_place_id is not the only unique index on this table - ux_biz_phone\n-- exists too, because the same real business can appear under two different\n-- Maps listings (a franchise's shared reception line, an agent's cell number\n-- reused on their own listing and their agency's). ON CONFLICT can only\n-- declare ONE target, so a place_id this table has never seen, carrying a\n-- phone number some OTHER row already owns, used to fail this whole\n-- statement with a bare UniqueViolation - not handled by ON CONFLICT at all,\n-- because that clause only watches google_place_id. Found running this for\n-- real: 150 Oslo real-estate listings, one agent's cell already on file\n-- under a different place_id, and the insert died there instead of\n-- continuing past it.\n--\n-- The fix is the same idea in both branches: SELECT ... WHERE NOT EXISTS\n-- refuses to attempt a write that WOULD collide on phone under a different\n-- place_id, on the INSERT side; DO UPDATE ... WHERE repeats the same check\n-- so a re-scrape that changes an existing row's phone to one already claimed\n-- elsewhere is skipped rather than erroring. Either way this business is\n-- already represented in the table - by itself, or by the row that holds its\n-- phone number - so silently leaving it as it was is correct, not a data\n-- loss.\n\nINSERT INTO businesses (\n  google_place_id, search_target_id, niche,\n  name, name_norm, category_primary, categories,\n  address, street, city, state, country, country_code, postal_code,\n  lat, lon, geohash7,\n  phone_raw, phone_e164, email, listing_url, social_profiles,\n  rating, review_count, price_level,\n  permanently_closed, temporarily_closed,\n  raw, source\n)\nSELECT\n  $1, $2, $3,\n  $4, $5, $6, $7,\n  $8, $9, $10, $11, $12, $13, $14,\n  $15, $16, $17,\n  $18, $19, $20, $21, $22,\n  $23, $24, $25,\n  $26, $27,\n  $28, $29\nWHERE NOT EXISTS (\n  SELECT 1 FROM businesses\n  WHERE phone_e164 = NULLIF($19, '') AND google_place_id <> $1\n)\nON CONFLICT (google_place_id) DO UPDATE SET\n  last_seen_at       = now(),\n  name               = EXCLUDED.name,\n  name_norm          = EXCLUDED.name_norm,\n  category_primary   = EXCLUDED.category_primary,\n  categories         = EXCLUDED.categories,\n  address            = EXCLUDED.address,\n  city               = EXCLUDED.city,\n  phone_raw          = EXCLUDED.phone_raw,\n  phone_e164         = EXCLUDED.phone_e164,\n  email              = COALESCE(NULLIF(EXCLUDED.email, ''), businesses.email),\n  listing_url        = EXCLUDED.listing_url,\n  social_profiles    = EXCLUDED.social_profiles,\n  rating             = EXCLUDED.rating,\n  review_count       = EXCLUDED.review_count,\n  permanently_closed = EXCLUDED.permanently_closed,\n  temporarily_closed = EXCLUDED.temporarily_closed,\n  raw                = EXCLUDED.raw\nWHERE NOT EXISTS (\n  SELECT 1 FROM businesses b2\n  WHERE b2.phone_e164 = NULLIF(EXCLUDED.phone_e164, '') AND b2.google_place_id <> EXCLUDED.google_place_id\n)\nRETURNING id, google_place_id, website_status, (xmax = 0) AS inserted;\n-- xmax = 0 distinguishes an INSERT from an UPDATE, which is how the run\n-- summary can honestly say \"12 new, 38 already known\" instead of \"50 found\"\n-- every single day. A row skipped by either WHERE NOT EXISTS returns no row\n-- at all - the caller counts that as neither, not as a failure.\n",
+        "options": {
+          "queryReplacement": "={{ [$json.google_place_id, $json.search_target_id, $json.niche, $json.name, $json.name_norm, $json.category_primary, $json.categories, $json.address, $json.street, $json.city, $json.state, $json.country, $json.country_code, $json.postal_code, $json.lat, $json.lon, $json.geohash7, $json.phone_raw, $json.phone_e164, $json.email, $json.listing_url, JSON.stringify($json.social_profiles), $json.rating, $json.review_count, $json.price_level, $json.permanently_closed, $json.temporarily_closed, JSON.stringify($json.raw), $json.source] }}"
+        }
+      },
+      "id": "ch01-store",
+      "name": "Store it, once",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1640,
+        300
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// CH-01, node: \"What did we find?\"\n// Mode: Run Once for All Items\n//\n// Builds the Telegram line and the numbers the next node writes back.\n//\n// The distinction that matters here is NEW versus ALREADY KNOWN. The upsert\n// returns `inserted` (from xmax = 0) precisely so this can be honest. A report\n// that says \"50 businesses found\" every morning when 48 of them were found\n// last week is a report that stops being read by Friday - and then the morning\n// it says something real, nobody notices.\n\nconst rows = $input.all().map((i) => i.json).filter((r) => r && r.id);\nconst brake = $('BRAKE: can we afford this run?').first().json;\n\nconst total = rows.length;\nconst inserted = rows.filter((r) => r.inserted === true).length;\nconst known = total - inserted;\n\n// Of the already-known rows, how many are still waiting on CH-02? Useful\n// because a growing backlog here is the first sign CH-02 has stopped running,\n// and that is invisible from CH-02's own output - a workflow that is not\n// running produces no report at all.\nconst pending = rows.filter((r) => r.website_status === 'PENDING').length;\n\nconst where = [brake.city, brake.country].filter(Boolean).join(', ');\n\nif (!total) {\n  // Zero results is a real finding, not an error: it can genuinely mean every\n  // business of this type in this city already has a website. Saying so\n  // plainly beats an empty message that reads as a broken workflow.\n  return [{\n    json: {\n      target_id: brake.target_id,\n      total: 0,\n      message:\n        `CH-01 ${brake.niche} / ${where}\\n` +\n        `No businesses without a website were returned.\\n` +\n        `Asked for up to ${brake.asked_for}. Either this market is saturated, ` +\n        `or the search term \"${brake.niche_query}\" is wrong for it.`,\n    },\n  }];\n}\n\nconst lines = [\n  `CH-01 ${brake.niche} / ${where}`,\n  `${inserted} new, ${known} already known (${total} returned)`,\n  `${pending} now waiting on verification`,\n];\n\nif (brake.budget_remaining != null) {\n  const left = brake.budget_remaining - total;\n  // Says WHICH limit is binding. \"Running low\" is not actionable on its own -\n  // raising our own cap and topping up the Apify plan are different jobs, and\n  // doing the wrong one leaves the pipeline just as stopped.\n  lines.push(`~${Math.max(0, left)} places left before ${brake.budget_binding} runs out` +\n             (brake.credit_remaining_usd != null ? ` ($${brake.credit_remaining_usd} credit)` : ''));\n  if (left < 100) {\n    lines.push(brake.budget_binding === 'Apify credit'\n      ? 'Apify credit is nearly gone. It resets on the 1st and does not roll over.'\n      : 'Our own cap is nearly reached. Raise app_state.apify_spend.monthly_place_cap.');\n  }\n}\n\n// A sample makes the report checkable at a glance. A number alone cannot be\n// sanity-checked; three names can.\nconst sample = rows.filter((r) => r.inserted).slice(0, 3).map((r) => r.google_place_id);\nif (sample.length) lines.push(`e.g. ${sample.join(', ')}`);\n\nreturn [{\n  json: {\n    target_id: brake.target_id,\n    total,\n    inserted,\n    known,\n    pending,\n    message: lines.join('\\n'),\n  },\n}];\n"
+      },
+      "id": "ch01-summary",
+      "name": "What did we find?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE search_targets SET last_run_at = now(), last_run_found = $2 WHERE id = $1;\nUPDATE app_state SET value = jsonb_set(jsonb_set(CASE WHEN value ->> 'month' = to_char(now(),'YYYY-MM') THEN value ELSE jsonb_set(jsonb_set(value, '{month}', to_jsonb(to_char(now(),'YYYY-MM'))), '{places_scraped}', '0') END, '{places_scraped}', to_jsonb(COALESCE((value ->> 'places_scraped')::int,0) + $2)), '{runs_started}', to_jsonb(COALESCE((value ->> 'runs_started')::int,0) + 1)) WHERE key = 'apify_spend';",
+        "options": {
+          "queryReplacement": "={{ [$json.target_id, $json.total] }}"
+        }
+      },
+      "id": "ch01-mark-run",
+      "name": "Record the run and the spend",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2080,
+        300
+      ],
+      "notes": "The spend counter resets itself when the month rolls over, in the same statement that increments it. A counter that needs a separate monthly reset job is a counter that will one day be a month stale and silently block every run.",
+      "credentials": {
+        "postgres": {
+          "name": "Client Hunt DB"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch01-telegram",
+      "name": "Tell me",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2300,
+        300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Config').first().json.telegram_chat_id }}",
+        "text": "=CH-01 did not run: {{ $json.reason }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ch01-telegram-halt",
+      "name": "Say why we stopped",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        320,
+        420
+      ],
+      "credentials": {
+        "telegramApi": {
+          "name": "Client Hunt Telegram"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## CH-01 \u2014 Discover businesses\n\nAsks Apify's Google Maps extractor for businesses **without a website** in one market, and stores what comes back.\n\n### The niche is not in this workflow\n\nNothing here names a niche or a city. `Pick one target` reads the next due row from the `search_targets` table. To hunt a new market:\n\n```sql\nINSERT INTO search_targets (niche, niche_query, country, city, cctlds, enabled)\nVALUES ('Dental Clinics', 'dental clinic', 'United Arab Emirates', 'Dubai', ARRAY['.ae','.com'], true);\n```\n\nTo stop hunting one, set `enabled = false`. No node is edited either way.\n\n### Setup\n\n1. Credential **HTTP Header Auth** named `Apify token` \u2014 name `Authorization`, value `Bearer <apify token>`.\n2. Credential **Postgres** pointing at the lead database.\n3. Credential **Telegram**, and put your chat id in `Config`.\n4. Run `db/001`, `db/002`, `db/003` first \u2014 this workflow reads three tables that those create.\n\n### What it deliberately does NOT do\n\n- It never sets `website_status`. That is CH-02's job, and the upsert explicitly preserves an existing verdict. If this workflow could reset a verified row to PENDING, every daily run would re-verify and re-spend on the entire database.\n- It processes **one target per run**. A bad target cannot consume the month's credit before anyone notices.\n\n### The brake\n\n`BRAKE: can we afford this run?` refuses to start once the monthly place cap in `app_state.apify_spend` is reached. The free plan is $5/month with no rollover, and Apify blocks runs at zero rather than warning first. The brake is in before the first live request, not after the first surprise bill.",
+        "height": 760,
+        "width": 620,
+        "color": 4
+      },
+      "id": "ch01-sticky",
+      "name": "What this is",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1480,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "q1",
+              "leftValue": "={{ $json.quiet !== true && new Date().getUTCMinutes() < 30 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ch01-worth-a-message",
+      "name": "Worth a message?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        100,
+        420
+      ],
+      "notes": "A routine stop (no budget left this month) is reported in the digest only. A real fault messages at most once an hour - CH-01 runs every 30 minutes."
+    }
+  ],
+  "connections": {
+    "Every 30 minutes": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "How much credit is left?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick one target": {
+      "main": [
+        [
+          {
+            "node": "BRAKE: can we afford this run?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "BRAKE: can we afford this run?": {
+      "main": [
+        [
+          {
+            "node": "Cleared to spend?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleared to spend?": {
+      "main": [
+        [
+          {
+            "node": "Start the scrape",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Worth a message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start the scrape": {
+      "main": [
+        [
+          {
+            "node": "Wait 20s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 20s": {
+      "main": [
+        [
+          {
+            "node": "Is it finished?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is it finished?": {
+      "main": [
+        [
+          {
+            "node": "Still running?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still running?": {
+      "main": [
+        [
+          {
+            "node": "Wait 20s",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Collect the results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect the results": {
+      "main": [
+        [
+          {
+            "node": "Normalise the business",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise the business": {
+      "main": [
+        [
+          {
+            "node": "Store it, once",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store it, once": {
+      "main": [
+        [
+          {
+            "node": "What did we find?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What did we find?": {
+      "main": [
+        [
+          {
+            "node": "Record the run and the spend",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record the run and the spend": {
+      "main": [
+        [
+          {
+            "node": "Tell me",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "How much credit is left?": {
+      "main": [
+        [
+          {
+            "node": "Pick one target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Worth a message?": {
+      "main": [
+        [
+          {
+            "node": "Say why we stopped",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  }
+}
